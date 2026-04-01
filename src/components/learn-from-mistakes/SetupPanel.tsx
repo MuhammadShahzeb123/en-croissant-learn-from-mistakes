@@ -11,20 +11,21 @@ import {
   Stack,
   Text,
   Alert,
-  Loader,
   Tooltip,
 } from "@mantine/core";
-import { IconAlertCircle, IconInfoCircle } from "@tabler/icons-react";
+import { IconAlertCircle, IconInfoCircle, IconCloud } from "@tabler/icons-react";
 import { useAtomValue } from "jotai";
 import { useTranslation } from "react-i18next";
 import { appDataDir, resolve } from "@tauri-apps/api/path";
 import { exists, mkdir } from "@tauri-apps/plugin-fs";
 import { commands } from "@/bindings";
-import type { MistakePuzzle, MistakeStats, MistakePuzzleFilter, EngineOption } from "@/bindings";
+import type { EngineOption } from "@/bindings";
 import { sessionsAtom, enginesAtom, type AnalysisConfig } from "@/state/atoms";
-import { unwrap } from "@/utils/unwrap";
+
 import { getDatabasesDir } from "@/utils/directories";
 import type { Engine, LocalEngine } from "@/utils/engines";
+
+const LICHESS_CLOUD_VALUE = "__lichess_cloud__";
 
 interface SetupPanelProps {
   onStart: (config: AnalysisConfig, analysisId: string) => void;
@@ -44,14 +45,25 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Build engine options (local engines only)
+  const isCloudEngine = selectedEngine === LICHESS_CLOUD_VALUE;
+
+  // Build engine options: local engines + Lichess cloud
   const localEngines = ((engines || []) as Engine[]).filter(
     (e: Engine): e is LocalEngine => e.type === "local",
   );
-  const engineOptions = localEngines.map((e: LocalEngine) => ({
-    value: e.path,
-    label: `${e.name} ${e.version || ""}`.trim(),
-  }));
+  const engineOptions = [
+    {
+      group: "Cloud",
+      items: [{ value: LICHESS_CLOUD_VALUE, label: "Lichess Cloud Eval" }],
+    },
+    {
+      group: "Local",
+      items: localEngines.map((e: LocalEngine) => ({
+        value: e.path,
+        label: `${e.name} ${e.version || ""}`.trim(),
+      })),
+    },
+  ];
 
   // When engine selection changes, load its stored settings as defaults
   const selectedLocalEngine = localEngines.find((e: LocalEngine) => e.path === selectedEngine);
@@ -124,8 +136,6 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
 
     try {
       const [source, username] = selectedAccount.split(/:(.+)/);
-      const engine = localEngines.find((e: LocalEngine) => e.path === selectedEngine);
-      if (!engine) throw new Error("Engine not found");
 
       // Find the database path for this user's games
       const dbDir = await getDatabasesDir();
@@ -148,21 +158,42 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
         );
       }
 
-      const config: AnalysisConfig = {
-        username,
-        source: source as "lichess" | "chess.com",
-        enginePath: engine.path,
-        engineName: engine.name,
-        depth,
-        dbPath,
-        mistakeDbPath,
-        minWinChanceDrop,
-        annotationFilter: annotations,
-        uciOptions: buildUciOptions(),
-      };
+      if (isCloudEngine) {
+        const config: AnalysisConfig = {
+          username,
+          source: source as "lichess" | "chess.com",
+          enginePath: "",
+          engineName: "Lichess Cloud",
+          engineType: "lichess",
+          depth: 0, // cloud determines depth
+          dbPath,
+          mistakeDbPath,
+          minWinChanceDrop,
+          annotationFilter: annotations,
+          uciOptions: [],
+        };
+        const analysisId = `mistake-analysis-cloud-${username}-${Date.now()}`;
+        onStart(config, analysisId);
+      } else {
+        const engine = localEngines.find((e: LocalEngine) => e.path === selectedEngine);
+        if (!engine) throw new Error("Engine not found");
 
-      const analysisId = `mistake-analysis-${username}-${Date.now()}`;
-      onStart(config, analysisId);
+        const config: AnalysisConfig = {
+          username,
+          source: source as "lichess" | "chess.com",
+          enginePath: engine.path,
+          engineName: engine.name,
+          engineType: "local",
+          depth,
+          dbPath,
+          mistakeDbPath,
+          minWinChanceDrop,
+          annotationFilter: annotations,
+          uciOptions: buildUciOptions(),
+        };
+        const analysisId = `mistake-analysis-${username}-${Date.now()}`;
+        onStart(config, analysisId);
+      }
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -171,7 +202,6 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
   }
 
   const noAccounts = accountOptions.length === 0;
-  const noEngines = engineOptions.length === 0;
 
   return (
     <Card withBorder shadow="sm" radius="md" p="lg">
@@ -179,12 +209,6 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
         {noAccounts && (
           <Alert icon={<IconAlertCircle size={16} />} color="yellow" title={t("LearnFromMistakes.NoAccounts")}>
             {t("LearnFromMistakes.NoAccountsDesc")}
-          </Alert>
-        )}
-
-        {noEngines && (
-          <Alert icon={<IconAlertCircle size={16} />} color="yellow" title={t("LearnFromMistakes.NoEngines")}>
-            {t("LearnFromMistakes.NoEnginesDesc")}
           </Alert>
         )}
 
@@ -203,55 +227,66 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
           data={engineOptions}
           value={selectedEngine}
           onChange={setSelectedEngine}
-          disabled={noEngines}
         />
 
-        <div>
-          <Text size="sm" fw={500} mb={4}>
-            {t("LearnFromMistakes.AnalysisDepth")} — {depth}
-          </Text>
-          <Slider
-            min={8}
-            max={30}
-            step={1}
-            value={depth}
-            onChange={setDepth}
-            marks={[
-              { value: 10, label: "10" },
-              { value: 15, label: "15" },
-              { value: 20, label: "20" },
-              { value: 25, label: "25" },
-              { value: 30, label: "30" },
-            ]}
-          />
-        </div>
+        {isCloudEngine && (
+          <Alert icon={<IconCloud size={16} />} color="blue" variant="light">
+            {t("LearnFromMistakes.CloudInfo", {
+              defaultValue: "Lichess Cloud uses pre-computed evaluations from Lichess servers. Positions not in the cloud database will be skipped. No local engine needed — much faster but may miss some positions.",
+            })}
+          </Alert>
+        )}
 
-        <Group grow>
-          <NumberInput
-            label={t("LearnFromMistakes.Threads", { defaultValue: "Threads" })}
-            description={t("LearnFromMistakes.ThreadsDesc", { defaultValue: "CPU threads for engine analysis" })}
-            min={1}
-            max={navigator.hardwareConcurrency || 128}
-            value={threads}
-            onChange={(v) => setThreads(Number(v) || 1)}
-          />
-          <Tooltip
-            label={t("LearnFromMistakes.HashTooltip", { defaultValue: "Memory allocated for engine hash table. Higher values improve analysis quality." })}
-            multiline
-            w={250}
-          >
-            <NumberInput
-              label={t("LearnFromMistakes.Hash", { defaultValue: "Hash (MB)" })}
-              description={t("LearnFromMistakes.HashDesc", { defaultValue: "Hash table size in megabytes" })}
-              min={1}
-              max={65536}
-              step={64}
-              value={hash}
-              onChange={(v) => setHash(Number(v) || 128)}
-              rightSection={<IconInfoCircle size={16} />}
-            />
-          </Tooltip>
-        </Group>
+        {!isCloudEngine && (
+          <>
+            <div>
+              <Text size="sm" fw={500} mb={4}>
+                {t("LearnFromMistakes.AnalysisDepth")} — {depth}
+              </Text>
+              <Slider
+                min={8}
+                max={30}
+                step={1}
+                value={depth}
+                onChange={setDepth}
+                marks={[
+                  { value: 10, label: "10" },
+                  { value: 15, label: "15" },
+                  { value: 20, label: "20" },
+                  { value: 25, label: "25" },
+                  { value: 30, label: "30" },
+                ]}
+              />
+            </div>
+
+            <Group grow>
+              <NumberInput
+                label={t("LearnFromMistakes.Threads", { defaultValue: "Threads" })}
+                description={t("LearnFromMistakes.ThreadsDesc", { defaultValue: "CPU threads for engine analysis" })}
+                min={1}
+                max={navigator.hardwareConcurrency || 128}
+                value={threads}
+                onChange={(v) => setThreads(Number(v) || 1)}
+              />
+              <Tooltip
+                label={t("LearnFromMistakes.HashTooltip", { defaultValue: "Memory allocated for engine hash table. Higher values improve analysis quality." })}
+                multiline
+                w={250}
+              >
+                <NumberInput
+                  label={t("LearnFromMistakes.Hash", { defaultValue: "Hash (MB)" })}
+                  description={t("LearnFromMistakes.HashDesc", { defaultValue: "Hash table size in megabytes" })}
+                  min={1}
+                  max={65536}
+                  step={64}
+                  value={hash}
+                  onChange={(v) => setHash(Number(v) || 128)}
+                  rightSection={<IconInfoCircle size={16} />}
+                />
+              </Tooltip>
+            </Group>
+          </>
+        )}
 
         <Checkbox.Group
           label={t("LearnFromMistakes.MistakeTypes")}
@@ -277,7 +312,9 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
           loading={loading}
           disabled={!selectedAccount || !selectedEngine || annotations.length === 0}
         >
-          {t("LearnFromMistakes.StartAnalysis")}
+          {isCloudEngine
+            ? t("LearnFromMistakes.StartCloudAnalysis", { defaultValue: "Start Cloud Analysis" })
+            : t("LearnFromMistakes.StartAnalysis")}
         </Button>
       </Stack>
     </Card>

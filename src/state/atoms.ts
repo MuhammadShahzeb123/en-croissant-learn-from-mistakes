@@ -705,6 +705,7 @@ export interface AnalysisConfig {
     source: "lichess" | "chess.com";
     enginePath: string;
     engineName: string;
+    engineType: "local" | "lichess"; // "local" = UCI binary, "lichess" = cloud API
     depth: number;
     dbPath: string;
     mistakeDbPath: string;

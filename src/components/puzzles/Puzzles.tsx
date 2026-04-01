@@ -87,6 +87,9 @@ function Puzzles({ id }: { id: string }) {
     });
   }, []);
 
+  // Track whether we should auto-generate a puzzle once DBs load
+  const autoGenTriggered = useRef(false);
+
   const [ratingRange, setRatingRange] = useAtom(puzzleRatingRangeAtom);
 
   const [selectedTheme, setSelectedTheme] = useAtom(puzzleThemeAtom);
@@ -189,6 +192,21 @@ function Puzzles({ id }: { id: string }) {
       setTimerStart(Date.now());
     }
   }
+
+  // Auto-generate first puzzle when a DB is selected and no puzzles are loaded
+  useEffect(() => {
+    if (selectedDb && puzzles.length === 0 && puzzleDbs.length > 0 && !autoGenTriggered.current) {
+      if (puzzleDbs.some((db) => db.path === selectedDb)) {
+        autoGenTriggered.current = true;
+        generatePuzzle(selectedDb, true);
+      }
+    }
+  }, [selectedDb, puzzleDbs.length]);
+
+  // Reset auto-gen flag when DB changes so next DB switch can auto-generate
+  useEffect(() => {
+    autoGenTriggered.current = false;
+  }, [selectedDb]);
 
   async function changeCompletion(completion: Completion) {
     const timeSpent = timerStart !== null ? Date.now() - timerStart : 0;

@@ -4,7 +4,11 @@
 En Croissant — A Modern Chess Database (Tauri + React + Mantine + Rust)
 
 ## Feature: Learn from Mistakes
-A feature inspired by Lichess's "Learn from Mistakes." It imports all games from a user's Chess.com or Lichess account, batch-analyzes them with a UCI engine, extracts positions where the player made inaccuracies/mistakes/blunders, and exports them as puzzles in the standard Lichess puzzle DB format — accessible from the existing Puzzles tab on the home page.
+A feature inspired by Lichess's "Learn from Mistakes." It imports all games from a user's Chess.com or Lichess account, analyzes them with either a **local UCI engine** or the **Lichess Cloud Evaluation API**, extracts positions where the player made inaccuracies/mistakes/blunders, and exports them as puzzles in the standard Lichess puzzle DB format — accessible from the existing Puzzles tab on the home page.
+
+### Engine Options
+- **Local Engine**: Select any installed UCI engine (Stockfish, etc.). Requires CPU, configurable depth/threads/hash.
+- **Lichess Cloud**: Uses pre-computed Lichess cloud evaluations (https://lichess.org/api/cloud-eval). No local engine needed. Positions not in the cloud DB are skipped. Much faster for common positions.
 
 ### Puzzle Flow
 1. User configures analysis on the **Learn** page (account, engine, depth, mistake types)
@@ -88,39 +92,50 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 - Backend (Cargo): ✅ Builds successfully (release, ~2m 07s)
   - Only non-blocking warnings: unused struct `MistakeAnalysisProgress`, unused fields in `GameRecord`
 
-## Latest Fixes (2026-04-02)
-- **Fixed Progress Stuck at 0% (Backend)**: Progress was only emitted per-game, so analyzing the first game showed 0% the entire time. Now:
-  - `analyze_single_game` accepts an `on_position_progress` callback
-  - Emits progress after each position within a game: `(game_base + pos_fraction) / total_games * 100`
-  - Users see smoothly incrementing progress within the first game instead of stuck at 0%
-- **Fixed Timer Not Updating (Frontend)**: The elapsed timer was computed in render body (`Date.now() - startTime`) but nothing triggered re-renders. Now:
-  - Uses `useState` for elapsed + `setInterval(1000)` that ticks every second
-  - Start time stored in Jotai atom, survives navigation
-- **Fixed Analysis Progress Lost on Navigation**: All state was local `useState`, destroyed when navigating away. Now:
-  - All analysis state stored in Jotai atoms (in-memory, survive route changes):
-    - `mistakeAnalysisViewAtom`, `mistakeAnalysisConfigAtom`, `mistakeAnalysisIdAtom`
-    - `mistakeAnalysisStartedAtom`, `mistakeAnalysisStartTimeAtom`
-    - `mistakePuzzlesAtom`, `mistakeStatsAtom`
-  - `AnalysisConfig` and `LearnView` types moved from `LearnFromMistakes.tsx` to `atoms.ts`
-  - `AnalysisProgress.tsx` reconnects on remount: checks `getProgress()` for current state, re-subscribes to events
-  - Analysis command dispatched only once (tracked by `mistakeAnalysisStartedAtom`)
-- **Fixed UCI Options Forwarding (Performance Fix)**: Engine's Threads and Hash settings were not being passed to mistake analysis (empty array). Now:
-  - `AnalysisConfig` includes `uciOptions: EngineOption[]` field
-  - `SetupPanel.tsx` reads selected engine's stored settings (Threads, Hash) as defaults
-  - Added Threads and Hash number inputs to setup UI for per-analysis override
-  - Forwards all stored engine settings (minus MultiPV/UCI_Chess960 which are managed internally)
-  - `AnalysisProgress.tsx` uses `config.uciOptions` instead of hardcoded empty array
-  - Backend (`mistake_puzzle.rs`) already handled UCI options correctly — no Rust changes needed
-  - This fix enables multi-threaded engine analysis, potentially 4-8x faster on multi-core CPUs
-- Fixed Tauri async Send error in mistake analysis by removing rusqlite connection usage from async awaits.
-  - `analyze_single_game` now returns in-memory pending puzzle rows.
-  - Database writes happen after async engine analysis completes via `insert_pending_mistakes`.
-- Confirmed full release build succeeds:
-  - Output: `src-tauri/target/release/en-croissant.exe`
-  - Build time: ~2m 21s
-  - Remaining warnings are non-blocking dead-code/unused-field warnings in `mistake_puzzle.rs`.
-- `src/translation/en-US.json` (added keys)
-- `src/translation/*.json` (all 15 other files: added SideBar.Learn)
+## Latest Fixes
+
+### Session 4: Lichess Cloud Engine + Puzzle Loading Fix
+- **Added Lichess Cloud Eval for mistake analysis**: Users can now choose "Lichess Cloud Eval" in the engine selector.
+  - Rust: `fetch_cloud_eval(client, fen, multipv)` calls `https://lichess.org/api/cloud-eval` via `reqwest`.
+  - Rust: `analyze_single_game_cloud()` — cloud variant of single-game analysis (no UCI process, HTTP only).
+  - Rust: `cloud_pv_to_score()` converts cloud API response PVs to `vampirc_uci::Score` for reuse with `score_from_player_perspective()`.
+  - Rust: `AnalyzeGamesRequest` gained `engine_type: String` ("local" | "lichess") field.
+  - Rust: `analyze_games_for_mistakes()` branches on `engine_type` — spawns local engine OR uses `reqwest::Client` for cloud.
+  - Rust: `Error::HttpError(String)` variant added for cloud API errors.
+  - TS: `AnalysisConfig.engineType` added ("local" | "lichess").
+  - TS: `AnalyzeGamesRequest` type updated with `engineType` field in `generated.ts`.
+  - TS: `SetupPanel.tsx` — engine selector now has grouped options: "Cloud" (Lichess Cloud Eval) and "Local" (installed engines). Depth/Threads/Hash hidden for cloud. Info alert shown when cloud selected.
+  - TS: `AnalysisProgress.tsx` — passes `engineType` to backend; shows "Cloud Evaluation" instead of depth for cloud.
+- **Fixed puzzle DB not loading after analysis**: After analysis completed, the Puzzle Training tab opened but showed an empty board with no DB selected.
+  - Root cause: `onComplete()` in AnalysisProgress set `view="setup"` which unmounted the component. `navigateToPuzzles()` executed after unmount but atom/route updates were unreliable.
+  - Fix: Removed `await` on `navigateToPuzzles()` — it's fire-and-forget since the Jotai atom writes and router navigate work independently of component lifecycle.
+  - Added auto-puzzle generation in `Puzzles.tsx`: when a DB is selected and no puzzles are loaded, the first puzzle is auto-generated (via `useEffect` + `useRef` guard to prevent re-triggers).
+- **Deleted old `mistake_puzzles.db3`** — stale data from broken eval logic.
+
+### Session 3: Puzzle Integration + Eval Bug Fix
+- **Fixed Critical Eval Bug for Black Players**: `normalize_cp()` was color-blind for the "after" position.
+  - For Black players, `eval_after_cp = -normalize_cp(score, player_color)` double-inverted, making `win_chance_drop` always negative → zero mistakes detected for Black games.
+  - Replaced with `score_from_player_perspective(score, side_to_move, player_color)` that correctly handles both before (side_to_move=player) and after (side_to_move=opponent) positions.
+  - White games always worked; Black games had 0 detections → explains "only 14 dubious from 54+ games."
+- **Added Predecessor Tracking**: Analysis now tracks the opponent's FEN and move before each player position.
+  - `predecessor_fen` and `predecessor_move` stored in `PendingMistakePuzzle` struct + DB columns.
+  - Used to construct Lichess-format puzzles: `fen=predecessor_fen`, `moves=predecessor_move + " " + best_line`.
+- **New Command: `export_mistakes_to_puzzle_db`**: Converts mistake_puzzles to standard Lichess puzzle DB format.
+  - Creates `puzzles`, `themes`, `puzzle_themes` tables.
+  - Assigns ratings: blunder=1000, mistake=1400, inaccuracy=1800.
+  - Themes: "blunder", "mistake", "inaccuracy", "my-mistakes".
+  - Trims moves to even length (so puzzle ends on user answer, not auto-play).
+- **Removed Custom Puzzle Board**: `MistakePuzzleBoard.tsx` no longer imported (was broken — board didn't render).
+  - After analysis, user is redirected to the existing Puzzles tab with the new DB auto-selected.
+  - `LearnFromMistakes.tsx` simplified to setup + analyzing views only.
+  - `AnalysisProgress.tsx` calls `exportMistakesToPuzzleDb` then `navigateToPuzzles()`.
+
+### Session 2: Progress + Navigation Fixes
+- Fixed progress stuck at 0%: position-level progress via `on_position_progress` callback.
+- Fixed timer: `setInterval(1000)` + Jotai atom for start time.
+- Fixed navigation loss: all state in Jotai atoms (survive route changes).
+- Fixed UCI options forwarding: Threads/Hash passed to engine.
+- Fixed Tauri async Send: `analyze_single_game` returns in-memory rows.
 
 ## Files Created
 - `src-tauri/src/mistake_puzzle.rs`
@@ -128,5 +143,9 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 - `src/components/learn-from-mistakes/LearnFromMistakes.tsx`
 - `src/components/learn-from-mistakes/SetupPanel.tsx`
 - `src/components/learn-from-mistakes/AnalysisProgress.tsx`
-- `src/components/learn-from-mistakes/MistakePuzzleBoard.tsx`
+- `src/components/learn-from-mistakes/MistakePuzzleBoard.tsx` (dead code — unused but retained)
 - `src/components/learn-from-mistakes/StatsPanel.tsx`
+
+## Important Notes
+- **Delete old mistake data**: Old `mistake_puzzles.db3` was generated with the broken eval logic (only White game mistakes). User should re-analyze after this fix.
+- **Puzzle DB location**: Exported to `puzzles/my_mistakes_<username>_<source>.db3`

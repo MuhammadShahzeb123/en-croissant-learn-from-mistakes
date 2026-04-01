@@ -110,6 +110,7 @@ export default function AnalysisProgress({
       .analyzeGamesForMistakes({
         id: analysisId,
         engine: config.enginePath,
+        engineType: config.engineType,
         goMode,
         uciOptions: config.uciOptions,
         dbPath: config.dbPath,
@@ -143,12 +144,16 @@ export default function AnalysisProgress({
           config.source,
         );
 
+        // Save stats to atom
         if (statsResult.status === "ok") {
           onComplete(statsResult.data);
         }
 
+        // Navigate to Puzzles tab. Do this AFTER onComplete so stats are saved.
+        // Even though onComplete unmounts this component, the Jotai atom setters
+        // and router navigate still work since they aren't component-scoped.
         if (exportResult.status === "ok" && exportResult.data > 0) {
-          await navigateToPuzzles(puzzleDbPath);
+          navigateToPuzzles(puzzleDbPath);
         } else {
           setFinished(true);
         }
@@ -198,7 +203,9 @@ export default function AnalysisProgress({
 
         <Group justify="space-between">
           <Text size="sm" c="dimmed">
-            {t("LearnFromMistakes.Depth")}: {config.depth}
+            {config.engineType === "lichess"
+              ? t("LearnFromMistakes.CloudEngine", { defaultValue: "Cloud Evaluation" })
+              : `${t("LearnFromMistakes.Depth")}: ${config.depth}`}
           </Text>
           <Text size="sm" c="dimmed">
             {minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`}

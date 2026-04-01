@@ -95,6 +95,9 @@ pub enum Error {
 
     #[error("Analysis cancelled")]
     AnalysisCancelled,
+
+    #[error("HTTP error: {0}")]
+    HttpError(String),
 }
 
 impl From<std::io::Error> for Error {

@@ -24,6 +24,81 @@ use crate::{
     AppState,
 };
 
+// ── Lichess Cloud Eval Types ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CloudEvalPv {
+    #[serde(default)]
+    cp: Option<i32>,
+    #[serde(default)]
+    mate: Option<i32>,
+    moves: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudEvalResponse {
+    fen: String,
+    #[serde(default)]
+    knodes: u64,
+    depth: u32,
+    pvs: Vec<CloudEvalPv>,
+}
+
+/// Fetch a cloud evaluation from Lichess for a given FEN.
+/// Returns None if the position is not in the cloud database (404).
+async fn fetch_cloud_eval(
+    client: &reqwest::Client,
+    fen: &str,
+    multipv: u16,
+) -> Result<Option<CloudEvalResponse>, Error> {
+    let url = format!(
+        "https://lichess.org/api/cloud-eval?fen={}&multiPv={}",
+        fen.replace(' ', "%20"),
+        multipv
+    );
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "EnCroissant/0.15.0 (https://github.com/franciscoBSalgueiro/en-croissant)")
+        .send()
+        .await
+        .map_err(|e| Error::HttpError(e.to_string()))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None); // Position not in cloud DB
+    }
+    if !resp.status().is_success() {
+        // Rate limited or server error — return None to skip
+        info!("Cloud eval returned status {} for FEN: {}", resp.status(), fen);
+        return Ok(None);
+    }
+
+    let data: CloudEvalResponse = resp
+        .json()
+        .await
+        .map_err(|e| Error::HttpError(e.to_string()))?;
+    Ok(Some(data))
+}
+
+/// Convert a CloudEvalPv into a vampirc_uci Score (for reuse with score_from_player_perspective)
+fn cloud_pv_to_score(pv: &CloudEvalPv) -> vampirc_uci::uci::Score {
+    use vampirc_uci::uci::{Score, ScoreValue};
+    if let Some(mate) = pv.mate {
+        Score {
+            value: ScoreValue::Mate(mate),
+            lower_bound: None,
+            upper_bound: None,
+            wdl: None,
+        }
+    } else {
+        Score {
+            value: ScoreValue::Cp(pv.cp.unwrap_or(0)),
+            lower_bound: None,
+            upper_bound: None,
+            wdl: None,
+        }
+    }
+}
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -197,6 +272,7 @@ fn classify_annotation(win_chance_drop: f64) -> &'static str {
 pub struct AnalyzeGamesRequest {
     pub id: String,
     pub engine: String,
+    pub engine_type: String, // "local" or "lichess"
     pub go_mode: GoMode,
     pub uci_options: Vec<EngineOption>,
     pub db_path: String,
@@ -215,6 +291,7 @@ pub async fn analyze_games_for_mistakes(
 ) -> Result<MistakeStats, Error> {
     let id = req.id;
     let engine = req.engine;
+    let engine_type = req.engine_type;
     let go_mode = req.go_mode;
     let uci_options = req.uci_options;
     let db_path = req.db_path;
@@ -236,78 +313,133 @@ pub async fn analyze_games_for_mistakes(
     let total_games = games.len() as i32;
 
     info!(
-        "Starting mistake analysis: {} games for {} from {}",
-        total_games, username, source
+        "Starting mistake analysis ({}): {} games for {} from {}",
+        engine_type, total_games, username, source
     );
 
     let mut pending_mistakes: Vec<PendingMistakePuzzle> = Vec::new();
 
-    // Spawn the engine
-    let engine_path = PathBuf::from(&engine);
-    let mut proc = BaseEngine::spawn(engine_path).await?;
-    proc.init_uci().await?;
-    let mut reader = proc.take_reader().ok_or(Error::EngineDisconnected)?;
+    if engine_type == "lichess" {
+        // ── Cloud analysis via Lichess API ──────────────────────────────
+        let client = reqwest::Client::new();
 
-    // Set UCI options
-    for opt in &uci_options {
-        if opt.name != "MultiPV" && opt.name != "UCI_Chess960" {
-            proc.set_option(&opt.name, &opt.value).await?;
-        }
-    }
-    // Force MultiPV=2
-    proc.set_option("MultiPV", "2").await?;
-
-    for (game_idx, game) in games.iter().enumerate() {
-        if cancel_flag.load(Ordering::SeqCst) {
-            info!("Analysis cancelled at game {}/{}", game_idx, total_games);
-            break;
-        }
-
-        update_progress(
-            &state.progress_state,
-            &app,
-            id.clone(),
-            (game_idx as f32 / total_games as f32) * 100.0,
-            false,
-        )?;
-
-        let result = analyze_single_game(
-            &mut proc,
-            &mut reader,
-            game,
-            &username,
-            &source,
-            &go_mode,
-            min_win_chance_drop,
-            |pos_fraction: f32| {
-                let overall = ((game_idx as f32 + pos_fraction) / total_games as f32) * 100.0;
-                let _ = update_progress(
-                    &state.progress_state,
-                    &app,
-                    id.clone(),
-                    overall,
-                    false,
-                );
-            },
-        )
-        .await;
-
-        match result {
-            Ok(game_mistakes) => {
-                info!("Game {}: found {} mistakes", game.id, game_mistakes.len());
-                pending_mistakes.extend(game_mistakes);
+        for (game_idx, game) in games.iter().enumerate() {
+            if cancel_flag.load(Ordering::SeqCst) {
+                info!("Analysis cancelled at game {}/{}", game_idx, total_games);
+                break;
             }
-            Err(e) => {
-                info!("Skipping game {}: {}", game.id, e);
-                continue;
+
+            update_progress(
+                &state.progress_state,
+                &app,
+                id.clone(),
+                (game_idx as f32 / total_games as f32) * 100.0,
+                false,
+            )?;
+
+            let result = analyze_single_game_cloud(
+                &client,
+                game,
+                &username,
+                &source,
+                min_win_chance_drop,
+                |pos_fraction: f32| {
+                    let overall =
+                        ((game_idx as f32 + pos_fraction) / total_games as f32) * 100.0;
+                    let _ = update_progress(
+                        &state.progress_state,
+                        &app,
+                        id.clone(),
+                        overall,
+                        false,
+                    );
+                },
+            )
+            .await;
+
+            match result {
+                Ok(game_mistakes) => {
+                    info!("Game {}: found {} mistakes (cloud)", game.id, game_mistakes.len());
+                    pending_mistakes.extend(game_mistakes);
+                }
+                Err(e) => {
+                    info!("Skipping game {}: {}", game.id, e);
+                    continue;
+                }
             }
         }
-    }
 
-    // Cleanup
-    proc.quit().await.ok();
-    state.analysis_cancel_flags.remove(&id);
-    update_progress(&state.progress_state, &app, id, 100.0, true)?;
+        state.analysis_cancel_flags.remove(&id);
+        update_progress(&state.progress_state, &app, id, 100.0, true)?;
+    } else {
+        // ── Local engine analysis ───────────────────────────────────────
+        let engine_path = PathBuf::from(&engine);
+        let mut proc = BaseEngine::spawn(engine_path).await?;
+        proc.init_uci().await?;
+        let mut reader = proc.take_reader().ok_or(Error::EngineDisconnected)?;
+
+        // Set UCI options
+        for opt in &uci_options {
+            if opt.name != "MultiPV" && opt.name != "UCI_Chess960" {
+                proc.set_option(&opt.name, &opt.value).await?;
+            }
+        }
+        // Force MultiPV=2
+        proc.set_option("MultiPV", "2").await?;
+
+        for (game_idx, game) in games.iter().enumerate() {
+            if cancel_flag.load(Ordering::SeqCst) {
+                info!("Analysis cancelled at game {}/{}", game_idx, total_games);
+                break;
+            }
+
+            update_progress(
+                &state.progress_state,
+                &app,
+                id.clone(),
+                (game_idx as f32 / total_games as f32) * 100.0,
+                false,
+            )?;
+
+            let result = analyze_single_game(
+                &mut proc,
+                &mut reader,
+                game,
+                &username,
+                &source,
+                &go_mode,
+                min_win_chance_drop,
+                |pos_fraction: f32| {
+                    let overall =
+                        ((game_idx as f32 + pos_fraction) / total_games as f32) * 100.0;
+                    let _ = update_progress(
+                        &state.progress_state,
+                        &app,
+                        id.clone(),
+                        overall,
+                        false,
+                    );
+                },
+            )
+            .await;
+
+            match result {
+                Ok(game_mistakes) => {
+                    info!("Game {}: found {} mistakes", game.id, game_mistakes.len());
+                    pending_mistakes.extend(game_mistakes);
+                }
+                Err(e) => {
+                    info!("Skipping game {}: {}", game.id, e);
+                    continue;
+                }
+            }
+        }
+
+        // Cleanup
+        proc.quit().await.ok();
+        state.analysis_cancel_flags.remove(&id);
+        update_progress(&state.progress_state, &app, id, 100.0, true)?;
+    }
 
     let mistake_conn = open_db(&mistake_db_path)?;
     insert_pending_mistakes(&mistake_conn, &pending_mistakes)?;
@@ -789,6 +921,200 @@ async fn analyze_single_game(
             win_chance_drop,
             eval_before: format_eval(eval_before_score),
             eval_after: format_eval(eval_after_score),
+            move_number,
+            engine_depth,
+            date_analyzed: now.clone(),
+            predecessor_fen: pred_fen.clone().unwrap_or_default(),
+            predecessor_move: pred_move.clone().unwrap_or_default(),
+        });
+    }
+
+    Ok(mistakes_found)
+}
+
+// ── Cloud-based single game analysis (Lichess API) ──────────────────────────
+
+async fn analyze_single_game_cloud(
+    client: &reqwest::Client,
+    game: &GameRecord,
+    username: &str,
+    source: &str,
+    min_win_chance_drop: f64,
+    on_position_progress: impl Fn(f32),
+) -> Result<Vec<PendingMistakePuzzle>, Error> {
+    let initial_fen = game
+        .fen
+        .as_deref()
+        .unwrap_or("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+    let fen: Fen = initial_fen.parse()?;
+    let setup = fen.as_setup().clone();
+    let castling_mode = CastlingMode::detect(&setup);
+    let mut chess: Chess = Chess::from_setup(setup, castling_mode)
+        .or_else(PositionError::ignore_too_much_material)
+        .map_err(|e| Error::ChessPosition(Box::new(e)))?;
+
+    // Determine player color
+    let player_is_white = username.eq_ignore_ascii_case(&game.white);
+    let player_color = if player_is_white {
+        Color::White
+    } else {
+        Color::Black
+    };
+    let opponent_color = if player_is_white {
+        Color::Black
+    } else {
+        Color::White
+    };
+    let color_str = if player_is_white { "white" } else { "black" };
+
+    // Decode all mainline moves, tracking positions and predecessor info
+    // (fen_before_str, played_uci, predecessor_fen, predecessor_move)
+    let mut positions: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+    let mut last_opponent_fen: Option<String> = None;
+    let mut last_opponent_move: Option<String> = None;
+
+    for move_byte in iter_mainline_move_bytes(&game.moves) {
+        let fen_before = Fen::from_position(chess.clone(), EnPassantMode::Legal);
+        let turn_before = chess.turn();
+
+        if let Some(m) = decode_move(move_byte, &chess) {
+            let uci = UciMove::from_move(&m, castling_mode).to_string();
+
+            if turn_before == player_color {
+                positions.push((
+                    fen_before.to_string(),
+                    uci.clone(),
+                    last_opponent_fen.take(),
+                    last_opponent_move.take(),
+                ));
+            } else {
+                last_opponent_fen = Some(fen_before.to_string());
+                last_opponent_move = Some(uci.clone());
+            }
+
+            chess.play_unchecked(&m);
+        } else {
+            break;
+        }
+    }
+
+    let game_id = game
+        .site
+        .as_deref()
+        .unwrap_or(&game.id.to_string())
+        .to_string();
+
+    let mut mistakes_found: Vec<PendingMistakePuzzle> = Vec::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    let total_positions = positions.len();
+
+    for (pos_idx, (fen_str, played_uci, pred_fen, pred_move)) in positions.iter().enumerate() {
+        let move_number = (pos_idx as i32) + 1;
+
+        if total_positions > 0 {
+            on_position_progress(pos_idx as f32 / total_positions as f32);
+        }
+
+        // Fetch cloud eval for the position BEFORE the player's move
+        let before_eval = match fetch_cloud_eval(client, fen_str, 2).await? {
+            Some(eval) => eval,
+            None => continue, // Position not in cloud DB, skip
+        };
+
+        if before_eval.pvs.is_empty() {
+            continue;
+        }
+
+        // Engine's best move from cloud
+        let cloud_best_moves_str = &before_eval.pvs[0].moves;
+        let cloud_best_uci = cloud_best_moves_str
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let cloud_best_line = cloud_best_moves_str.to_string();
+
+        // Eval before: cloud reports from side-to-move's perspective
+        let eval_before_score = cloud_pv_to_score(&before_eval.pvs[0]);
+        let eval_before_cp =
+            score_from_player_perspective(&eval_before_score, player_color, player_color);
+
+        // Did the player play the cloud's best move?
+        if played_uci == &cloud_best_uci {
+            continue; // Good move
+        }
+
+        // Compute FEN after the player's actual move
+        let fen_after_str = {
+            let f: Fen = fen_str.parse()?;
+            let s = f.into_setup();
+            let cm = CastlingMode::detect(&s);
+            let mut pos = Chess::from_setup(s, cm)
+                .or_else(PositionError::ignore_too_much_material)
+                .map_err(|e| Error::ChessPosition(Box::new(e)))?;
+            let uci: UciMove = played_uci.parse()?;
+            let m = uci.to_move(&pos)?;
+            pos.play_unchecked(&m);
+            Fen::from_position(pos, EnPassantMode::Legal).to_string()
+        };
+
+        // Fetch cloud eval for position AFTER the player's move
+        let after_eval = match fetch_cloud_eval(client, &fen_after_str, 1).await? {
+            Some(eval) => eval,
+            None => continue, // Position after move not in cloud DB
+        };
+
+        if after_eval.pvs.is_empty() {
+            continue;
+        }
+
+        // Eval after: side-to-move = opponent
+        let eval_after_score = cloud_pv_to_score(&after_eval.pvs[0]);
+        let eval_after_cp =
+            score_from_player_perspective(&eval_after_score, opponent_color, player_color);
+
+        let win_before = get_win_chance(eval_before_cp);
+        let win_after = get_win_chance(eval_after_cp);
+        let win_chance_drop = win_before - win_after;
+
+        if win_chance_drop < min_win_chance_drop {
+            continue;
+        }
+
+        let annotation = classify_annotation(win_chance_drop);
+        if annotation.is_empty() {
+            continue;
+        }
+
+        let cp_loss = (eval_before_cp - eval_after_cp).max(0.0) as i32;
+        let engine_depth = before_eval.depth as i32;
+
+        // Opponent's best response after the bad move
+        let opponent_punishment = after_eval.pvs[0]
+            .moves
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let opponent_line = after_eval.pvs[0].moves.clone();
+
+        mistakes_found.push(PendingMistakePuzzle {
+            source: source.to_string(),
+            username: username.to_string(),
+            game_id: game_id.clone(),
+            fen: fen_str.clone(),
+            player_color: color_str.to_string(),
+            played_move: played_uci.clone(),
+            best_move: cloud_best_uci,
+            best_line: cloud_best_line,
+            opponent_punishment,
+            opponent_line,
+            annotation: annotation.to_string(),
+            cp_loss,
+            win_chance_drop,
+            eval_before: format_eval(&eval_before_score),
+            eval_after: format_eval(&eval_after_score),
             move_number,
             engine_depth,
             date_analyzed: now.clone(),
