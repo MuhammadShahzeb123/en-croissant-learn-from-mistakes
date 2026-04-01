@@ -11,6 +11,7 @@ mod game;
 
 mod fs;
 mod lexer;
+mod mistake_puzzle;
 mod oauth;
 mod opening;
 mod pgn;
@@ -57,6 +58,10 @@ use crate::pgn::{count_pgn_games, delete_game, read_games, write_game};
 use crate::puzzle::{
     delete_puzzle_database, get_puzzle, get_puzzle_db_info, get_puzzle_themes,
     get_themes_for_puzzle,
+};
+use crate::mistake_puzzle::{
+    analyze_games_for_mistakes, delete_mistake_puzzles, get_mistake_puzzles, get_mistake_stats,
+    init_mistake_db, update_mistake_puzzle_completion,
 };
 use crate::sound::get_sound_server_port;
 use crate::{
@@ -168,7 +173,13 @@ fn main() {
             preload_reference_db,
             get_progress,
             clear_progress,
-            get_sound_server_port
+            get_sound_server_port,
+            analyze_games_for_mistakes,
+            get_mistake_puzzles,
+            update_mistake_puzzle_completion,
+            get_mistake_stats,
+            delete_mistake_puzzles,
+            init_mistake_db
         ))
         .events(tauri_specta::collect_events!(
             BestMovesPayload,

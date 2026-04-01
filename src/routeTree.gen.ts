@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as LearnFromMistakesRouteImport } from './routes/learn-from-mistakes'
 import { Route as FilesRouteImport } from './routes/files'
 import { Route as EnginesRouteImport } from './routes/engines'
 import { Route as AccountsRouteImport } from './routes/accounts'
@@ -20,6 +21,11 @@ import { Route as DatabasesDatabaseIdRouteImport } from './routes/databases/$dat
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LearnFromMistakesRoute = LearnFromMistakesRouteImport.update({
+  id: '/learn-from-mistakes',
+  path: '/learn-from-mistakes',
   getParentRoute: () => rootRouteImport,
 } as any)
 const FilesRoute = FilesRouteImport.update({
@@ -58,6 +64,7 @@ export interface FileRoutesByFullPath {
   '/accounts': typeof AccountsRoute
   '/engines': typeof EnginesRoute
   '/files': typeof FilesRoute
+  '/learn-from-mistakes': typeof LearnFromMistakesRoute
   '/settings': typeof SettingsRoute
   '/databases/$databaseId': typeof DatabasesDatabaseIdRoute
   '/databases/': typeof DatabasesIndexRoute
@@ -67,6 +74,7 @@ export interface FileRoutesByTo {
   '/accounts': typeof AccountsRoute
   '/engines': typeof EnginesRoute
   '/files': typeof FilesRoute
+  '/learn-from-mistakes': typeof LearnFromMistakesRoute
   '/settings': typeof SettingsRoute
   '/databases/$databaseId': typeof DatabasesDatabaseIdRoute
   '/databases': typeof DatabasesIndexRoute
@@ -77,6 +85,7 @@ export interface FileRoutesById {
   '/accounts': typeof AccountsRoute
   '/engines': typeof EnginesRoute
   '/files': typeof FilesRoute
+  '/learn-from-mistakes': typeof LearnFromMistakesRoute
   '/settings': typeof SettingsRoute
   '/databases/$databaseId': typeof DatabasesDatabaseIdRoute
   '/databases/': typeof DatabasesIndexRoute
@@ -88,6 +97,7 @@ export interface FileRouteTypes {
     | '/accounts'
     | '/engines'
     | '/files'
+    | '/learn-from-mistakes'
     | '/settings'
     | '/databases/$databaseId'
     | '/databases/'
@@ -97,6 +107,7 @@ export interface FileRouteTypes {
     | '/accounts'
     | '/engines'
     | '/files'
+    | '/learn-from-mistakes'
     | '/settings'
     | '/databases/$databaseId'
     | '/databases'
@@ -106,6 +117,7 @@ export interface FileRouteTypes {
     | '/accounts'
     | '/engines'
     | '/files'
+    | '/learn-from-mistakes'
     | '/settings'
     | '/databases/$databaseId'
     | '/databases/'
@@ -116,6 +128,7 @@ export interface RootRouteChildren {
   AccountsRoute: typeof AccountsRoute
   EnginesRoute: typeof EnginesRoute
   FilesRoute: typeof FilesRoute
+  LearnFromMistakesRoute: typeof LearnFromMistakesRoute
   SettingsRoute: typeof SettingsRoute
   DatabasesDatabaseIdRoute: typeof DatabasesDatabaseIdRoute
   DatabasesIndexRoute: typeof DatabasesIndexRoute
@@ -128,6 +141,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/learn-from-mistakes': {
+      id: '/learn-from-mistakes'
+      path: '/learn-from-mistakes'
+      fullPath: '/learn-from-mistakes'
+      preLoaderRoute: typeof LearnFromMistakesRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/files': {
@@ -180,6 +200,7 @@ const rootRouteChildren: RootRouteChildren = {
   AccountsRoute: AccountsRoute,
   EnginesRoute: EnginesRoute,
   FilesRoute: FilesRoute,
+  LearnFromMistakesRoute: LearnFromMistakesRoute,
   SettingsRoute: SettingsRoute,
   DatabasesDatabaseIdRoute: DatabasesDatabaseIdRoute,
   DatabasesIndexRoute: DatabasesIndexRoute,

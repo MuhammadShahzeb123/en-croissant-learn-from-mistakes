@@ -46,6 +46,9 @@ pub enum Error {
     R2d2(Box<diesel::r2d2::PoolError>),
 
     #[error(transparent)]
+    Rusqlite(Box<rusqlite::Error>),
+
+    #[error(transparent)]
     SystemTime(Box<std::time::SystemTimeError>),
 
     #[error("No stdin")]
@@ -175,6 +178,12 @@ impl From<diesel::result::Error> for Error {
 impl From<diesel::r2d2::PoolError> for Error {
     fn from(value: diesel::r2d2::PoolError) -> Self {
         Self::R2d2(Box::new(value))
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Rusqlite(Box::new(value))
     }
 }
 

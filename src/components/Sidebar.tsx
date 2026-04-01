@@ -7,6 +7,7 @@ import {
   IconDatabase,
   IconFiles,
   IconSettings,
+  IconTargetArrow,
   IconUser,
 } from "@tabler/icons-react";
 import { Link, useMatchRoute } from "@tanstack/react-router";
@@ -47,6 +48,7 @@ const linksdata = [
     url: "/databases",
   },
   { icon: IconCpu, label: "Engines", url: "/engines" },
+  { icon: IconTargetArrow, label: "Learn", url: "/learn-from-mistakes" },
 ];
 
 export function SideBar() {

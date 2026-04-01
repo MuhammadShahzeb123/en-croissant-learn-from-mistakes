@@ -1,7 +1,7 @@
-mod encoding;
+pub mod encoding;
 mod models;
 mod ops;
-mod schema;
+pub mod schema;
 mod search;
 mod search_index;
 
