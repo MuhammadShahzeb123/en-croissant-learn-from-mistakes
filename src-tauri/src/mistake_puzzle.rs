@@ -106,7 +106,9 @@ CREATE TABLE IF NOT EXISTS mistake_puzzles (
     move_number INTEGER NOT NULL,
     engine_depth INTEGER NOT NULL,
     date_analyzed TEXT NOT NULL,
-    completed INTEGER NOT NULL DEFAULT 0
+    completed INTEGER NOT NULL DEFAULT 0,
+    predecessor_fen TEXT NOT NULL DEFAULT '',
+    predecessor_move TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_mp_username ON mistake_puzzles(username);
@@ -118,6 +120,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_mp_dedup ON mistake_puzzles(username, sour
 
 fn ensure_table(conn: &rusqlite::Connection) -> Result<(), Error> {
     conn.execute_batch(CREATE_MISTAKE_PUZZLES_TABLE)?;
+    // Migration: add predecessor columns if table existed before this update
+    let _ = conn.execute_batch(
+        "ALTER TABLE mistake_puzzles ADD COLUMN predecessor_fen TEXT NOT NULL DEFAULT '';
+         ALTER TABLE mistake_puzzles ADD COLUMN predecessor_move TEXT NOT NULL DEFAULT '';",
+    );
     Ok(())
 }
 
@@ -134,7 +141,20 @@ fn get_win_chance(cp: f64) -> f64 {
     50.0 + 50.0 * (2.0 / (1.0 + (-0.00368208 * cp).exp()) - 1.0)
 }
 
-fn normalize_cp(score: &vampirc_uci::uci::Score, color: Color) -> f64 {
+/// Convert an engine score to centipawns from the PLAYER's perspective.
+/// `side_to_move` is whose turn it is in the position the engine evaluated.
+/// `player_color` is the color the human player was playing.
+///
+/// The engine always reports from side-to-move's perspective:
+///   positive = good for side-to-move, negative = bad for side-to-move.
+///
+/// If side_to_move == player_color, score is already from player's view.
+/// If side_to_move != player_color (opponent's turn), negate to get player's view.
+fn score_from_player_perspective(
+    score: &vampirc_uci::uci::Score,
+    side_to_move: Color,
+    player_color: Color,
+) -> f64 {
     use vampirc_uci::uci::ScoreValue;
     let raw = match score.value {
         ScoreValue::Cp(cp) => cp as f64,
@@ -146,8 +166,8 @@ fn normalize_cp(score: &vampirc_uci::uci::Score, color: Color) -> f64 {
             }
         }
     };
-    let cp = if color == Color::Black { -raw } else { raw };
-    cp.clamp(-1000.0, 1000.0)
+    let cp = if side_to_move == player_color { raw } else { -raw };
+    cp.clamp(-10000.0, 10000.0)
 }
 
 fn format_eval(score: &vampirc_uci::uci::Score) -> String {
@@ -259,6 +279,16 @@ pub async fn analyze_games_for_mistakes(
             &source,
             &go_mode,
             min_win_chance_drop,
+            |pos_fraction: f32| {
+                let overall = ((game_idx as f32 + pos_fraction) / total_games as f32) * 100.0;
+                let _ = update_progress(
+                    &state.progress_state,
+                    &app,
+                    id.clone(),
+                    overall,
+                    false,
+                );
+            },
         )
         .await;
 
@@ -321,6 +351,8 @@ struct PendingMistakePuzzle {
     move_number: i32,
     engine_depth: i32,
     date_analyzed: String,
+    predecessor_fen: String,
+    predecessor_move: String,
 }
 
 fn insert_pending_mistakes(
@@ -333,8 +365,9 @@ fn insert_pending_mistakes(
                 source, username, game_id, fen, player_color, played_move,
                 best_move, best_line, opponent_punishment, opponent_line,
                 annotation, cp_loss, win_chance_drop, eval_before, eval_after,
-                move_number, engine_depth, date_analyzed, completed
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0)",
+                move_number, engine_depth, date_analyzed, completed,
+                predecessor_fen, predecessor_move
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19, ?20)",
             rusqlite::params![
                 &item.source,
                 &item.username,
@@ -354,6 +387,8 @@ fn insert_pending_mistakes(
                 item.move_number,
                 item.engine_depth,
                 &item.date_analyzed,
+                &item.predecessor_fen,
+                &item.predecessor_move,
             ],
         )?;
     }
@@ -480,6 +515,7 @@ async fn analyze_single_game(
     source: &str,
     go_mode: &GoMode,
     min_win_chance_drop: f64,
+    on_position_progress: impl Fn(f32),
 ) -> Result<Vec<PendingMistakePuzzle>, Error> {
     let initial_fen = game
         .fen
@@ -502,9 +538,12 @@ async fn analyze_single_game(
     };
     let color_str = if player_is_white { "white" } else { "black" };
 
-    // Decode all mainline moves to UCI strings
-    let mut positions: Vec<(Fen, Vec<String>, String)> = Vec::new(); // (fen_before, moves_before, played_uci)
+    // Decode all mainline moves to UCI strings, tracking predecessor info
+    // Each entry: (fen_before, moves_before, played_uci, predecessor_fen, predecessor_move)
+    let mut positions: Vec<(Fen, Vec<String>, String, Option<String>, Option<String>)> = Vec::new();
     let mut uci_moves_so_far: Vec<String> = Vec::new();
+    let mut last_opponent_fen: Option<String> = None;
+    let mut last_opponent_move: Option<String> = None;
 
     for move_byte in iter_mainline_move_bytes(&game.moves) {
         let fen_before =
@@ -514,13 +553,19 @@ async fn analyze_single_game(
         if let Some(m) = decode_move(move_byte, &chess) {
             let uci = UciMove::from_move(&m, castling_mode).to_string();
 
-            // Only analyze positions where it's the player's turn
             if turn_before == player_color {
+                // Player's turn — record position with predecessor info
                 positions.push((
                     fen_before,
                     uci_moves_so_far.clone(),
                     uci.clone(),
+                    last_opponent_fen.take(),
+                    last_opponent_move.take(),
                 ));
+            } else {
+                // Opponent's turn — save as predecessor for the next player position
+                last_opponent_fen = Some(fen_before.to_string());
+                last_opponent_move = Some(uci.clone());
             }
 
             chess.play_unchecked(&m);
@@ -539,8 +584,15 @@ async fn analyze_single_game(
     let mut mistakes_found: Vec<PendingMistakePuzzle> = Vec::new();
     let now = chrono::Utc::now().to_rfc3339();
 
-    for (pos_idx, (fen_before, moves_before, played_uci)) in positions.iter().enumerate() {
+    let total_positions = positions.len();
+
+    for (pos_idx, (fen_before, moves_before, played_uci, pred_fen, pred_move)) in positions.iter().enumerate() {
         let move_number = (pos_idx as i32) + 1;
+
+        // Emit position-level progress within this game
+        if total_positions > 0 {
+            on_position_progress(pos_idx as f32 / total_positions as f32);
+        }
 
         // Set position and run engine
         proc.set_position(&initial_fen, moves_before).await?;
@@ -611,8 +663,9 @@ async fn analyze_single_game(
             .unwrap_or_default();
 
         // Score of the position when playing the engine's best move
+        // Before move: side-to-move = player_color
         let eval_before_score = &best_lines[0].score;
-        let eval_before_cp = normalize_cp(eval_before_score, player_color);
+        let eval_before_cp = score_from_player_perspective(eval_before_score, player_color, player_color);
 
         // Did the player play the engine's best move?
         if played_uci == &engine_best_uci {
@@ -685,11 +738,10 @@ async fn analyze_single_game(
             continue;
         }
 
-        // Eval after the player's move (from opponent's perspective, so invert)
+        // Eval after the player's move: side-to-move = opponent
         let eval_after_score = &after_lines[0].score;
-        // The engine returned eval from the perspective of the side to move (opponent).
-        // We need it from the player's perspective, so invert.
-        let eval_after_cp = -normalize_cp(eval_after_score, player_color);
+        let opponent_color = if player_color == Color::White { Color::Black } else { Color::White };
+        let eval_after_cp = score_from_player_perspective(eval_after_score, opponent_color, player_color);
 
         let win_before = get_win_chance(eval_before_cp);
         let win_after = get_win_chance(eval_after_cp);
@@ -740,6 +792,8 @@ async fn analyze_single_game(
             move_number,
             engine_depth,
             date_analyzed: now.clone(),
+            predecessor_fen: pred_fen.clone().unwrap_or_default(),
+            predecessor_move: pred_move.clone().unwrap_or_default(),
         });
     }
 
@@ -956,4 +1010,177 @@ pub fn delete_mistake_puzzles(
 pub fn init_mistake_db(db_path: String) -> Result<(), Error> {
     open_db(&db_path)?;
     Ok(())
+}
+
+// ── Export mistakes as standard puzzle DB ────────────────────────────────────
+
+const CREATE_PUZZLE_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS puzzles (
+    id INTEGER PRIMARY KEY,
+    fen TEXT NOT NULL,
+    moves TEXT NOT NULL,
+    rating INTEGER NOT NULL DEFAULT 1500,
+    rating_deviation INTEGER NOT NULL DEFAULT 0,
+    popularity INTEGER NOT NULL DEFAULT 0,
+    nb_plays INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS themes (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS puzzle_themes (
+    puzzle_id INTEGER NOT NULL,
+    theme_id INTEGER NOT NULL,
+    PRIMARY KEY (puzzle_id, theme_id),
+    FOREIGN KEY (puzzle_id) REFERENCES puzzles(id),
+    FOREIGN KEY (theme_id) REFERENCES themes(id)
+);
+";
+
+fn rating_from_annotation(annotation: &str) -> i32 {
+    match annotation {
+        "??" => 1000,  // Blunders are often obvious to spot
+        "?"  => 1400,  // Mistakes require moderate skill
+        "?!" => 1800,  // Inaccuracies are subtle
+        _    => 1500,
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn export_mistakes_to_puzzle_db(
+    mistake_db_path: String,
+    puzzle_db_path: String,
+    username: String,
+    source: String,
+) -> Result<i32, Error> {
+    let mistake_conn = open_db(&mistake_db_path)?;
+
+    // Read all mistakes with predecessor info
+    let mut stmt = mistake_conn.prepare(
+        "SELECT predecessor_fen, predecessor_move, best_line, annotation
+         FROM mistake_puzzles
+         WHERE username = ?1 AND source = ?2
+         ORDER BY id ASC",
+    )?;
+
+    struct ExportRow {
+        predecessor_fen: String,
+        predecessor_move: String,
+        best_line: String,
+        annotation: String,
+    }
+
+    let rows: Vec<ExportRow> = stmt
+        .query_map(rusqlite::params![&username, &source], |row| {
+            Ok(ExportRow {
+                predecessor_fen: row.get(0)?,
+                predecessor_move: row.get(1)?,
+                best_line: row.get(2)?,
+                annotation: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Create/open the puzzle DB
+    let puzzle_conn = rusqlite::Connection::open(&puzzle_db_path)?;
+    puzzle_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    puzzle_conn.execute_batch(CREATE_PUZZLE_TABLES)?;
+
+    // Insert themes
+    let theme_names = ["blunder", "mistake", "inaccuracy", "my-mistakes"];
+    for name in &theme_names {
+        puzzle_conn.execute(
+            "INSERT OR IGNORE INTO themes (name) VALUES (?1)",
+            rusqlite::params![name],
+        )?;
+    }
+
+    // Get theme IDs
+    let get_theme_id = |name: &str| -> Result<i64, Error> {
+        Ok(puzzle_conn.query_row(
+            "SELECT id FROM themes WHERE name = ?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        )?)
+    };
+    let blunder_theme_id = get_theme_id("blunder")?;
+    let mistake_theme_id = get_theme_id("mistake")?;
+    let inaccuracy_theme_id = get_theme_id("inaccuracy")?;
+    let my_mistakes_theme_id = get_theme_id("my-mistakes")?;
+
+    // Clear existing puzzles (re-export replaces all)
+    puzzle_conn.execute("DELETE FROM puzzle_themes", [])?;
+    puzzle_conn.execute("DELETE FROM puzzles", [])?;
+
+    let mut exported = 0i32;
+
+    for row in &rows {
+        // Determine the puzzle FEN and moves
+        let (puzzle_fen, puzzle_moves) = if !row.predecessor_fen.is_empty()
+            && !row.predecessor_move.is_empty()
+        {
+            // Standard format: FEN before opponent's move, moves = [opponent_move, best_line...]
+            let moves = format!("{} {}", row.predecessor_move, row.best_line);
+            (row.predecessor_fen.clone(), moves)
+        } else if !row.best_line.is_empty() {
+            // No predecessor (first move of game) — use FEN directly
+            // Put a dummy setup: the player's actual bad move as setup, then opponent punishment
+            // Skip these — they don't cleanly map to the puzzle format
+            continue;
+        } else {
+            continue;
+        };
+
+        // Ensure moves has an even number of tokens (ends on user answer)
+        let move_tokens: Vec<&str> = puzzle_moves.split_whitespace().collect();
+        let trimmed = if move_tokens.len() % 2 == 1 {
+            // Odd total: the last move would be auto-played (opponent response, not a user answer)
+            // Trim it so the puzzle ends on the user's answer
+            move_tokens[..move_tokens.len() - 1].join(" ")
+        } else {
+            puzzle_moves.clone()
+        };
+
+        if trimmed.split_whitespace().count() < 2 {
+            continue; // Need at least setup + answer
+        }
+
+        let rating = rating_from_annotation(&row.annotation);
+
+        puzzle_conn.execute(
+            "INSERT INTO puzzles (fen, moves, rating, rating_deviation, popularity, nb_plays)
+             VALUES (?1, ?2, ?3, 0, 0, 0)",
+            rusqlite::params![&puzzle_fen, &trimmed, rating],
+        )?;
+
+        let puzzle_id = puzzle_conn.last_insert_rowid();
+
+        // Link to "my-mistakes" theme
+        puzzle_conn.execute(
+            "INSERT OR IGNORE INTO puzzle_themes (puzzle_id, theme_id) VALUES (?1, ?2)",
+            rusqlite::params![puzzle_id, my_mistakes_theme_id],
+        )?;
+
+        // Link to annotation-specific theme
+        let annotation_theme_id = match row.annotation.as_str() {
+            "??" => Some(blunder_theme_id),
+            "?"  => Some(mistake_theme_id),
+            "?!" => Some(inaccuracy_theme_id),
+            _    => None,
+        };
+        if let Some(tid) = annotation_theme_id {
+            puzzle_conn.execute(
+                "INSERT OR IGNORE INTO puzzle_themes (puzzle_id, theme_id) VALUES (?1, ?2)",
+                rusqlite::params![puzzle_id, tid],
+            )?;
+        }
+
+        exported += 1;
+    }
+
+    Ok(exported)
 }

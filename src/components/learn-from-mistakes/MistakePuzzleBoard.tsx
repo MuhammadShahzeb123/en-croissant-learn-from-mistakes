@@ -35,7 +35,7 @@ import { commands } from "@/bindings";
 import type { MistakePuzzle, MistakeStats } from "@/bindings";
 import { positionFromFen } from "@/utils/chessops";
 import classes from "@/styles/Chessboard.module.css";
-import type { AnalysisConfig } from "./LearnFromMistakes";
+import type { AnalysisConfig } from "@/state/atoms";
 import PromotionModal from "../boards/PromotionModal";
 
 type PuzzleMode = "find_correct" | "punish_mistake";

@@ -507,6 +507,14 @@ async initMistakeDb(dbPath: string) : Promise<Result<null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async exportMistakesToPuzzleDb(mistakeDbPath: string, puzzleDbPath: string, username: string, source: string) : Promise<Result<number, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("export_mistakes_to_puzzle_db", { mistakeDbPath, puzzleDbPath, username, source }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 

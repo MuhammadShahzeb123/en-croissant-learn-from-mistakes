@@ -692,3 +692,31 @@ export const enableAllAtom = atom(null, (get, set, value: boolean) => {
         set(atom, { ...get(atom), enabled: value });
     }
 });
+
+// ── Learn from Mistakes ─────────────────────────────────────────────────────
+// In-memory atoms that survive route navigation but not app restarts.
+
+import type { MistakePuzzle, MistakeStats, EngineOption } from "@/bindings";
+
+export type LearnView = "setup" | "analyzing" | "puzzles";
+
+export interface AnalysisConfig {
+    username: string;
+    source: "lichess" | "chess.com";
+    enginePath: string;
+    engineName: string;
+    depth: number;
+    dbPath: string;
+    mistakeDbPath: string;
+    minWinChanceDrop: number;
+    annotationFilter: string[];
+    uciOptions: EngineOption[];
+}
+
+export const mistakeAnalysisViewAtom = atom<LearnView>("setup");
+export const mistakeAnalysisConfigAtom = atom<AnalysisConfig | null>(null);
+export const mistakeAnalysisIdAtom = atom<string>("");
+export const mistakeAnalysisStartedAtom = atom<boolean>(false);
+export const mistakeAnalysisStartTimeAtom = atom<number>(0);
+export const mistakePuzzlesAtom = atom<MistakePuzzle[]>([]);
+export const mistakeStatsAtom = atom<MistakeStats | null>(null);

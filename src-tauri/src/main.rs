@@ -60,8 +60,8 @@ use crate::puzzle::{
     get_themes_for_puzzle,
 };
 use crate::mistake_puzzle::{
-    analyze_games_for_mistakes, delete_mistake_puzzles, get_mistake_puzzles, get_mistake_stats,
-    init_mistake_db, update_mistake_puzzle_completion,
+    analyze_games_for_mistakes, delete_mistake_puzzles, export_mistakes_to_puzzle_db,
+    get_mistake_puzzles, get_mistake_stats, init_mistake_db, update_mistake_puzzle_completion,
 };
 use crate::sound::get_sound_server_port;
 use crate::{
@@ -179,7 +179,8 @@ fn main() {
             update_mistake_puzzle_completion,
             get_mistake_stats,
             delete_mistake_puzzles,
-            init_mistake_db
+            init_mistake_db,
+            export_mistakes_to_puzzle_db
         ))
         .events(tauri_specta::collect_events!(
             BestMovesPayload,
