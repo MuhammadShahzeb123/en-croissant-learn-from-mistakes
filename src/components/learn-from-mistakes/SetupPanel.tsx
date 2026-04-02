@@ -26,6 +26,7 @@ import { getDatabasesDir } from "@/utils/directories";
 import type { Engine, LocalEngine } from "@/utils/engines";
 
 const LICHESS_CLOUD_VALUE = "__lichess_cloud__";
+const HYBRID_VALUE = "__hybrid__";
 
 interface SetupPanelProps {
   onStart: (config: AnalysisConfig, analysisId: string) => void;
@@ -38,6 +39,7 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
 
   const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
   const [selectedEngine, setSelectedEngine] = useState<string | null>(null);
+  const [selectedHybridEngine, setSelectedHybridEngine] = useState<string | null>(null);
   const [depth, setDepth] = useState<number>(18);
   const [threads, setThreads] = useState<number>(1);
   const [hash, setHash] = useState<number>(128);
@@ -46,6 +48,7 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
   const [error, setError] = useState<string | null>(null);
 
   const isCloudEngine = selectedEngine === LICHESS_CLOUD_VALUE;
+  const isHybridEngine = selectedEngine === HYBRID_VALUE;
 
   // Build engine options: local engines + Lichess cloud
   const localEngines = ((engines || []) as Engine[]).filter(
@@ -57,6 +60,10 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
       items: [{ value: LICHESS_CLOUD_VALUE, label: "Lichess Cloud Eval" }],
     },
     {
+      group: "Hybrid",
+      items: [{ value: HYBRID_VALUE, label: "Hybrid (Cloud + Local Engine)" }],
+    },
+    {
       group: "Local",
       items: localEngines.map((e: LocalEngine) => ({
         value: e.path,
@@ -66,14 +73,15 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
   ];
 
   // When engine selection changes, load its stored settings as defaults
-  const selectedLocalEngine = localEngines.find((e: LocalEngine) => e.path === selectedEngine);
+  const activeEnginePath = isHybridEngine ? selectedHybridEngine : selectedEngine;
+  const selectedLocalEngine = localEngines.find((e: LocalEngine) => e.path === activeEnginePath);
   useEffect(() => {
     if (!selectedLocalEngine?.settings) return;
     for (const s of selectedLocalEngine.settings) {
       if (s.name === "Threads" && s.value != null) setThreads(Number(s.value));
       if (s.name === "Hash" && s.value != null) setHash(Number(s.value));
     }
-  }, [selectedEngine]);
+  }, [activeEnginePath]);
 
   // Build account options from sessions
   const accountOptions: { value: string; label: string }[] = [];
@@ -174,6 +182,25 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
         };
         const analysisId = `mistake-analysis-cloud-${username}-${Date.now()}`;
         onStart(config, analysisId);
+      } else if (isHybridEngine) {
+        const engine = localEngines.find((e: LocalEngine) => e.path === selectedHybridEngine);
+        if (!engine) throw new Error("Please select a local engine for hybrid mode");
+
+        const config: AnalysisConfig = {
+          username,
+          source: source as "lichess" | "chess.com",
+          enginePath: engine.path,
+          engineName: `Hybrid (${engine.name})`,
+          engineType: "hybrid",
+          depth,
+          dbPath,
+          mistakeDbPath,
+          minWinChanceDrop,
+          annotationFilter: annotations,
+          uciOptions: buildUciOptions(),
+        };
+        const analysisId = `mistake-analysis-hybrid-${username}-${Date.now()}`;
+        onStart(config, analysisId);
       } else {
         const engine = localEngines.find((e: LocalEngine) => e.path === selectedEngine);
         if (!engine) throw new Error("Engine not found");
@@ -235,6 +262,28 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
               defaultValue: "Lichess Cloud uses pre-computed evaluations from Lichess servers. Positions not in the cloud database will be skipped. No local engine needed — much faster but may miss some positions.",
             })}
           </Alert>
+        )}
+
+        {isHybridEngine && (
+          <>
+            <Alert icon={<IconCloud size={16} />} color="teal" variant="light">
+              {t("LearnFromMistakes.HybridInfo", {
+                defaultValue: "Hybrid mode tries Lichess Cloud Eval first (free & fast), then falls back to your local engine for positions not in the cloud. Best of both worlds — fast and thorough.",
+              })}
+            </Alert>
+
+            <Select
+              label={t("LearnFromMistakes.SelectFallbackEngine", { defaultValue: "Fallback Engine" })}
+              description={t("LearnFromMistakes.FallbackEngineDesc", { defaultValue: "Local engine used when cloud eval is unavailable" })}
+              placeholder={t("LearnFromMistakes.SelectEnginePlaceholder")}
+              data={localEngines.map((e: LocalEngine) => ({
+                value: e.path,
+                label: `${e.name} ${e.version || ""}`.trim(),
+              }))}
+              value={selectedHybridEngine}
+              onChange={setSelectedHybridEngine}
+            />
+          </>
         )}
 
         {!isCloudEngine && (
@@ -310,11 +359,13 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
           size="md"
           onClick={handleStart}
           loading={loading}
-          disabled={!selectedAccount || !selectedEngine || annotations.length === 0}
+          disabled={!selectedAccount || !selectedEngine || annotations.length === 0 || (isHybridEngine && !selectedHybridEngine)}
         >
           {isCloudEngine
             ? t("LearnFromMistakes.StartCloudAnalysis", { defaultValue: "Start Cloud Analysis" })
-            : t("LearnFromMistakes.StartAnalysis")}
+            : isHybridEngine
+              ? t("LearnFromMistakes.StartHybridAnalysis", { defaultValue: "Start Hybrid Analysis" })
+              : t("LearnFromMistakes.StartAnalysis")}
         </Button>
       </Stack>
     </Card>

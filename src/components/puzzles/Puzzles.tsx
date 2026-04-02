@@ -203,9 +203,17 @@ function Puzzles({ id }: { id: string }) {
     }
   }, [selectedDb, puzzleDbs.length]);
 
-  // Reset auto-gen flag when DB changes so next DB switch can auto-generate
+  // Reset auto-gen flag and clear stale puzzles when DB changes
+  const previousDbRef = useRef<string | null>(null);
   useEffect(() => {
     autoGenTriggered.current = false;
+    // Clear old puzzles when switching to a different DB so fresh ones are loaded
+    if (previousDbRef.current !== null && previousDbRef.current !== selectedDb) {
+      setPuzzles([]);
+      setCurrentPuzzle(0);
+      goToStart();
+    }
+    previousDbRef.current = selectedDb;
   }, [selectedDb]);
 
   async function changeCompletion(completion: Completion) {

@@ -18,6 +18,7 @@ import {
   selectedPuzzleDbAtom,
 } from "@/state/atoms";
 import { getPuzzlesDir } from "@/utils/directories";
+import { genID } from "@/utils/tabs";
 
 interface AnalysisProgressProps {
   onComplete: (stats: MistakeStats) => void;
@@ -35,7 +36,7 @@ export default function AnalysisProgress({
   const [started, setStarted] = useAtom(mistakeAnalysisStartedAtom);
   const startTime = useAtomValue(mistakeAnalysisStartTimeAtom);
   const [, setTabs] = useAtom(tabsAtom);
-  const activeTab = useAtomValue(activeTabAtom);
+  const [activeTab, setActiveTab] = useAtom(activeTabAtom);
   const setSelectedPuzzleDb = useSetAtom(selectedPuzzleDbAtom);
 
   const [progress, setProgress] = useState(0);
@@ -85,17 +86,35 @@ export default function AnalysisProgress({
   // Navigate to Puzzles tab with the new puzzle DB selected
   async function navigateToPuzzles(puzzleDbPath: string) {
     setSelectedPuzzleDb(puzzleDbPath);
+
+    // Create a new puzzles tab (or convert the active one)
+    const newTabId = genID();
     setTabs((prev) => {
+      // Try to find and convert the active tab first
       if (activeTab) {
-        const tab = prev.find((tab) => tab.value === activeTab);
-        if (tab) {
-          tab.name = t("Home.PuzzleTraining", { defaultValue: "Puzzle Training" });
-          tab.type = "puzzles";
+        const existing = prev.find((tab) => tab.value === activeTab);
+        if (existing) {
+          existing.name = t("Home.PuzzleTraining", { defaultValue: "Puzzle Training" });
+          existing.type = "puzzles";
           return [...prev];
         }
       }
-      return prev;
+      // No active tab found — create a new puzzles tab
+      const puzzleTab = {
+        value: newTabId,
+        name: t("Home.PuzzleTraining", { defaultValue: "Puzzle Training" }),
+        type: "puzzles" as const,
+        gameOrigin: { kind: "none" as const },
+      };
+      if (prev.length === 0 || (prev.length === 1 && prev[0].type === "new")) {
+        return [puzzleTab];
+      }
+      return [...prev, puzzleTab];
     });
+    // If we didn't convert an existing tab, activate the new one
+    if (!activeTab) {
+      setActiveTab(newTabId);
+    }
     navigate({ to: "/" });
   }
 
@@ -205,7 +224,9 @@ export default function AnalysisProgress({
           <Text size="sm" c="dimmed">
             {config.engineType === "lichess"
               ? t("LearnFromMistakes.CloudEngine", { defaultValue: "Cloud Evaluation" })
-              : `${t("LearnFromMistakes.Depth")}: ${config.depth}`}
+              : config.engineType === "hybrid"
+                ? `${t("LearnFromMistakes.HybridEngine", { defaultValue: "Hybrid (Cloud + Engine)" })} — ${t("LearnFromMistakes.Depth")}: ${config.depth}`
+                : `${t("LearnFromMistakes.Depth")}: ${config.depth}`}
           </Text>
           <Text size="sm" c="dimmed">
             {minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`}

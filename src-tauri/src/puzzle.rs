@@ -14,6 +14,7 @@ use crate::{
 struct PuzzleCache {
     cache: VecDeque<Puzzle>,
     counter: usize,
+    file: String,
     min_rating: u16,
     max_rating: u16,
     theme: Option<String>,
@@ -24,6 +25,7 @@ impl PuzzleCache {
         Self {
             cache: VecDeque::new(),
             counter: 0,
+            file: String::new(),
             min_rating: 0,
             max_rating: 0,
             theme: None,
@@ -38,6 +40,7 @@ impl PuzzleCache {
         theme: &Option<String>,
     ) -> Result<(), Error> {
         if self.cache.is_empty()
+            || self.file != file
             || self.min_rating != min_rating
             || self.max_rating != max_rating
             || self.theme != *theme
@@ -68,6 +71,7 @@ impl PuzzleCache {
             };
 
             self.cache = new_puzzles.into_iter().collect();
+            self.file = file.to_string();
             self.min_rating = min_rating;
             self.max_rating = max_rating;
             self.theme = theme.clone();

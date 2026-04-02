@@ -9,6 +9,13 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 ### Engine Options
 - **Local Engine**: Select any installed UCI engine (Stockfish, etc.). Requires CPU, configurable depth/threads/hash.
 - **Lichess Cloud**: Uses pre-computed Lichess cloud evaluations (https://lichess.org/api/cloud-eval). No local engine needed. Positions not in the cloud DB are skipped. Much faster for common positions.
+- **Hybrid (Cloud + Local)**: Tries Lichess Cloud Eval first (free, fast), then falls back to a local engine for positions not in the cloud. Best of both worlds. Features:
+  - Waterfall pattern: cloud first → local engine fallback per position
+  - Smart position filtering: skips first 4 player moves (opening theory)
+  - In-memory FEN cache: avoids re-analyzing identical positions across games
+  - Parallel analysis: up to 4 games concurrently via tokio semaphore
+  - Cloud rate limiting: ≥1s between Lichess API requests, HTTP 429 retry (60s wait)
+  - Cloud depth threshold: only accepts cloud evals with depth ≥ 20
 
 ### Puzzle Flow
 1. User configures analysis on the **Learn** page (account, engine, depth, mistake types)
@@ -94,6 +101,26 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 
 ## Latest Fixes
 
+### Session 6: Hybrid Analysis Mode
+- **Added hybrid engine mode** (mistake_puzzle.rs): New `"hybrid"` branch in `analyze_games_for_mistakes` that combines Lichess Cloud Eval with local UCI engine in a waterfall pattern. Cloud is tried first; if it returns no result (404, timeout, depth < 20), the local engine is spawned lazily and used instead. Each parallel task gets its own engine instance.
+- **Parallel game analysis** (mistake_puzzle.rs): Hybrid mode processes up to 4 games concurrently using `tokio::spawn` + `Semaphore(4)`. Shared state (FEN cache, rate limiter, counters) is passed via `Arc`.
+- **FEN cache** (mistake_puzzle.rs): `FenCache = Arc<TokioMutex<HashMap<String, CachedEval>>>` avoids re-analyzing duplicate positions across games. Populated by both cloud and engine results.
+- **Cloud rate limiter** (mistake_puzzle.rs): `CloudRateLimiter` enforces ≥1s between Lichess API requests globally across all parallel tasks. HTTP 429 triggers a 60s wait + single retry.
+- **Smart position filtering** (mistake_puzzle.rs): `MIN_PLAYER_MOVE_NUMBER = 5` skips the first 4 player moves (opening theory) in hybrid mode.
+- **Frontend hybrid option** (SetupPanel.tsx): Added `HYBRID_VALUE` constant and "Hybrid" group in engine selector. Shows fallback engine selector + depth/threads/hash config. Disables start button until fallback engine is chosen.
+- **Frontend AnalysisProgress** (AnalysisProgress.tsx): Updated engine type display to show "Hybrid (Cloud + Engine)" badge with depth.
+- **Atoms type update** (atoms.ts): `AnalysisConfig.engineType` now accepts `"local" | "lichess" | "hybrid"`.
+- **Bindings update** (generated.ts): `MistakeAnalysisProgress` type updated to match new Rust struct fields: `gamesDone, gamesTotal, positionsAnalyzed, cloudHits, engineAnalyzed, cacheHits, estimatedSecondsLeft`.
+
+### Session 5: Puzzle Loading + Detection Fixes
+- **Fixed puzzle cache not invalidating on DB switch** (puzzle.rs): Static `PuzzleCache` now tracks `file` path. When the puzzle DB changes (e.g., switching from Lichess DB to mistake puzzles DB), the cache is invalidated and puzzles reload from the correct DB.
+- **Fixed navigation after analysis to Puzzles tab** (AnalysisProgress.tsx): If no active tab exists, a new "Puzzle Training" tab is created instead of silently failing. Uses `genID()` to create unique tab IDs.
+- **Fixed stale puzzles persisting on DB switch** (Puzzles.tsx): When `selectedPuzzleDbAtom` changes, old puzzle array is cleared and `currentPuzzle` reset, allowing auto-generation to trigger for the new DB.
+- **Added auto-clear of old mistakes before re-analysis** (mistake_puzzle.rs): `analyze_games_for_mistakes()` now DELETEs existing `mistake_puzzles` rows for the same username+source before inserting fresh results. Prevents stale data accumulation.
+- **Added detailed logging throughout analysis pipeline** (mistake_puzzle.rs): Logs decode failures (ply number, positions collected), positions per game, export stats (exported/skipped counts). Helps diagnose low puzzle counts.
+- **Export now fetches additional columns for fallback** (mistake_puzzle.rs): Export query includes `fen`, `opponent_punishment`, `opponent_line` alongside predecessor fields. First-move-of-game mistakes (no predecessor) are logged and skipped with a count.
+- **Clean release rebuild**: Deleted old exe + 2.2 GiB of build artifacts, full rebuild from scratch.
+
 ### Session 4: Lichess Cloud Engine + Puzzle Loading Fix
 - **Added Lichess Cloud Eval for mistake analysis**: Users can now choose "Lichess Cloud Eval" in the engine selector.
   - Rust: `fetch_cloud_eval(client, fen, multipv)` calls `https://lichess.org/api/cloud-eval` via `reqwest`.
@@ -147,5 +174,7 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 - `src/components/learn-from-mistakes/StatsPanel.tsx`
 
 ## Important Notes
-- **Delete old mistake data**: Old `mistake_puzzles.db3` was generated with the broken eval logic (only White game mistakes). User should re-analyze after this fix.
+- **Re-analysis auto-clears old data**: Running analysis again for the same user+source deletes old `mistake_puzzles` rows before inserting new ones. No manual cleanup needed.
 - **Puzzle DB location**: Exported to `puzzles/my_mistakes_<username>_<source>.db3`
+- **Puzzle cache**: Rust-side `PuzzleCache` now tracks which file was loaded. Switching DBs forces a reload.
+- **First-move mistakes**: If a player's very first move in a game is a mistake (no predecessor move exists), it's logged but skipped during export — these can't be represented in the standard Lichess puzzle format.
