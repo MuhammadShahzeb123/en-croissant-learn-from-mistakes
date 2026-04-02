@@ -184,6 +184,8 @@ export default function MistakePuzzleBoard({
         return "orange";
       case "?!":
         return "yellow";
+      case "miss":
+        return "cyan";
       default:
         return "gray";
     }
@@ -197,9 +199,27 @@ export default function MistakePuzzleBoard({
         return t("Annotate.Mistake");
       case "?!":
         return t("Annotate.Dubious");
+      case "miss":
+        return t("LearnFromMistakes.Miss", { defaultValue: "Missed Opportunity" });
       default:
         return annotation;
     }
+  }
+
+  function getMissTypeBadge(puzzle: MistakePuzzle | undefined) {
+    if (!puzzle || !puzzle.isMiss) return null;
+    const missTypeLabel = puzzle.missType === "MATE_MISSED"
+      ? t("LearnFromMistakes.MateMissed", { defaultValue: "Missed Forced Mate" })
+      : puzzle.missType === "WINNING_OPPORTUNITY_MISSED"
+        ? t("LearnFromMistakes.WinningMissed", { defaultValue: "Missed Winning Move" })
+        : "";
+    if (!missTypeLabel) return null;
+    return (
+      <Badge color="cyan" variant="light" size="sm">
+        {missTypeLabel}
+        {puzzle.mateIn > 0 ? ` (M${puzzle.mateIn})` : ""}
+      </Badge>
+    );
   }
 
   const { ref: parentRef, height: parentHeight } = useElementSize();
@@ -346,6 +366,26 @@ export default function MistakePuzzleBoard({
                 {getAnnotationLabel(puzzle?.annotation || "")} ({puzzle?.annotation})
               </Badge>
             </Group>
+
+            {/* Miss type badge */}
+            {getMissTypeBadge(puzzle)}
+
+            {/* Classification badge */}
+            {puzzle?.moveClassification && (
+              <Badge
+                color={
+                  puzzle.moveClassification === "MISS" ? "cyan" :
+                  puzzle.moveClassification === "BLUNDER" ? "red" :
+                  puzzle.moveClassification === "MISTAKE" ? "orange" :
+                  puzzle.moveClassification === "INACCURACY" ? "yellow" :
+                  "gray"
+                }
+                variant="outline"
+                size="sm"
+              >
+                {puzzle.moveClassification} (Δ{puzzle.evalDelta}cp)
+              </Badge>
+            )}
 
             {/* Move info */}
             {puzzle && (

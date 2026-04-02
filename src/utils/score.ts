@@ -117,3 +117,82 @@ export function getAnnotation(
     }
     return "";
 }
+
+// ── Enhanced classification & accuracy (from miss detection briefing) ────────
+
+/**
+ * Compute per-move accuracy from eval delta (centipawns).
+ * Uses Chess.com's publicly reverse-engineered formula.
+ */
+export function moveAccuracyFromDelta(evalDeltaCp: number): number {
+    const cpl = Math.max(0, evalDeltaCp) / 100; // convert to pawns
+    const accuracy = 103.1668 * Math.exp(-0.04354 * cpl) - 3.1669;
+    return Math.min(100, Math.max(0, accuracy));
+}
+
+/**
+ * Compute overall game accuracy from an array of eval deltas (centipawns).
+ * Averages the per-move accuracy scores clamped to [0, 100].
+ */
+export function gameAccuracyFromDeltas(evalDeltas: number[]): number {
+    if (evalDeltas.length === 0) return 0;
+    const sum = evalDeltas.reduce((acc, d) => acc + moveAccuracyFromDelta(d), 0);
+    return Math.min(100, Math.max(0, sum / evalDeltas.length));
+}
+
+/**
+ * Classify a move by centipawn eval delta.
+ * Returns one of: "BEST", "EXCELLENT", "GOOD", "INACCURACY", "MISTAKE", "BLUNDER", "MISS"
+ */
+export function classifyMoveByCp(
+    evalDelta: number,
+    wasMateAvailable: boolean,
+    isMateAllowedAfter: boolean,
+): string {
+    if (wasMateAvailable) return "MISS";
+    if (isMateAllowedAfter) return "BLUNDER";
+    if (evalDelta <= 10) return "BEST";
+    if (evalDelta <= 25) return "EXCELLENT";
+    if (evalDelta <= 50) return "GOOD";
+    if (evalDelta <= 100) return "INACCURACY";
+    if (evalDelta <= 300) return "MISTAKE";
+    return "BLUNDER";
+}
+
+/**
+ * Get a human-readable label for a miss type.
+ */
+export function getMissTypeLabel(missType: string): string {
+    switch (missType) {
+        case "MATE_MISSED":
+            return "Missed Forced Mate";
+        case "WINNING_OPPORTUNITY_MISSED":
+            return "Missed Winning Move";
+        default:
+            return "";
+    }
+}
+
+/**
+ * Get a color for each move classification.
+ */
+export function getClassificationColor(classification: string): string {
+    switch (classification) {
+        case "BEST":
+            return "teal";
+        case "EXCELLENT":
+            return "green";
+        case "GOOD":
+            return "lime";
+        case "INACCURACY":
+            return "yellow";
+        case "MISTAKE":
+            return "orange";
+        case "BLUNDER":
+            return "red";
+        case "MISS":
+            return "cyan";
+        default:
+            return "gray";
+    }
+}

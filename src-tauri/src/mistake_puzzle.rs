@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -26,6 +26,9 @@ use crate::{
     AppState,
 };
 
+// ── Shared engine for hybrid mode (one process, serialized access) ──────────
+type SharedEngine = Arc<TokioMutex<Option<(BaseEngine, EngineReader)>>>;
+
 // ── Lichess Cloud Eval Types ────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +41,7 @@ struct CloudEvalPv {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct CloudEvalResponse {
     fen: String,
     #[serde(default)]
@@ -121,10 +125,17 @@ struct CachedEval {
     depth: u32,
 }
 
-/// Rate limiter for Lichess cloud API — enforces ≥1s between requests globally.
+/// Rate limiter for Lichess cloud API with adaptive backoff.
+/// Base interval: 200ms (5 req/s). On HTTP 429, interval doubles (up to 5s)
+/// and gradually recovers after successful requests.
 struct CloudRateLimiter {
     last_request: TokioMutex<tokio::time::Instant>,
+    /// Current interval in ms — starts at 200, increased on 429, decays on success
+    interval_ms: TokioMutex<u64>,
 }
+
+const CLOUD_BASE_INTERVAL_MS: u64 = 200;
+const CLOUD_MAX_INTERVAL_MS: u64 = 5000;
 
 impl CloudRateLimiter {
     fn new() -> Self {
@@ -132,17 +143,35 @@ impl CloudRateLimiter {
             last_request: TokioMutex::new(
                 tokio::time::Instant::now() - std::time::Duration::from_secs(2),
             ),
+            interval_ms: TokioMutex::new(CLOUD_BASE_INTERVAL_MS),
         }
     }
 
     async fn wait(&self) {
+        let interval = { *self.interval_ms.lock().await };
         let mut last = self.last_request.lock().await;
         let elapsed = last.elapsed();
-        let min_interval = std::time::Duration::from_millis(1000);
+        let min_interval = std::time::Duration::from_millis(interval);
         if elapsed < min_interval {
             tokio::time::sleep(min_interval - elapsed).await;
         }
         *last = tokio::time::Instant::now();
+    }
+
+    /// Call after a successful cloud response — gradually reduce interval back to base.
+    async fn on_success(&self) {
+        let mut interval = self.interval_ms.lock().await;
+        if *interval > CLOUD_BASE_INTERVAL_MS {
+            // Halve toward base on each success
+            *interval = (*interval / 2).max(CLOUD_BASE_INTERVAL_MS);
+        }
+    }
+
+    /// Call on HTTP 429 — double the interval (capped).
+    async fn on_rate_limited(&self) {
+        let mut interval = self.interval_ms.lock().await;
+        *interval = (*interval * 2).min(CLOUD_MAX_INTERVAL_MS);
+        info!("Cloud rate limiter: interval increased to {}ms after 429", *interval);
     }
 }
 
@@ -169,9 +198,9 @@ impl HybridCounters {
 
 /// Fetch cloud eval for hybrid mode with:
 /// - 3s timeout
-/// - Depth >= min_depth check
-/// - HTTP 429 retry (wait 60s, retry once)
-/// - Rate limiting via shared CloudRateLimiter
+/// - Depth >= min_depth check (default 16 — sufficient for blunder detection)
+/// - HTTP 429 adaptive backoff with retry
+/// - Rate limiting via shared CloudRateLimiter (200ms base, adaptive)
 async fn fetch_cloud_eval_hybrid(
     client: &reqwest::Client,
     fen: &str,
@@ -212,8 +241,11 @@ async fn fetch_cloud_eval_hybrid(
     let status = resp.status();
 
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        info!("Cloud eval rate limited (429), waiting 60s and retrying...");
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        // Adaptive backoff: increase the rate limiter interval and wait before retry
+        rate_limiter.on_rate_limited().await;
+        let backoff = { *rate_limiter.interval_ms.lock().await };
+        info!("Cloud eval 429 — backing off {}ms before retry", backoff);
+        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
         rate_limiter.wait().await;
         let result2 = client
             .get(&url)
@@ -238,6 +270,7 @@ async fn fetch_cloud_eval_hybrid(
         if data.depth < min_depth {
             return Ok(None);
         }
+        rate_limiter.on_success().await;
         return Ok(Some(data));
     }
 
@@ -252,6 +285,7 @@ async fn fetch_cloud_eval_hybrid(
     if data.depth < min_depth {
         return Ok(None);
     }
+    rate_limiter.on_success().await;
     Ok(Some(data))
 }
 
@@ -284,6 +318,12 @@ pub struct MistakePuzzle {
     pub engine_depth: i32,
     pub date_analyzed: String,
     pub completed: i32, // 0=unsolved, 1=correct, 2=wrong
+    pub is_miss: i32,
+    pub miss_opportunity_cp: i32,
+    pub move_classification: String,
+    pub miss_type: String,
+    pub eval_delta: i32,
+    pub mate_in: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -296,11 +336,14 @@ pub struct MistakeStats {
     pub blunders: i64,
     pub mistakes: i64,
     pub inaccuracies: i64,
+    pub misses: i64,
     pub accuracy: f64,
+    pub game_accuracy: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct MistakeAnalysisProgress {
     pub games_done: u32,
     pub games_total: u32,
@@ -347,14 +390,23 @@ CREATE TABLE IF NOT EXISTS mistake_puzzles (
     date_analyzed TEXT NOT NULL,
     completed INTEGER NOT NULL DEFAULT 0,
     predecessor_fen TEXT NOT NULL DEFAULT '',
-    predecessor_move TEXT NOT NULL DEFAULT ''
+    predecessor_move TEXT NOT NULL DEFAULT '',
+    is_miss INTEGER NOT NULL DEFAULT 0,
+    miss_opportunity_cp INTEGER NOT NULL DEFAULT 0,
+    move_classification TEXT NOT NULL DEFAULT '',
+    miss_type TEXT NOT NULL DEFAULT '',
+    eval_delta INTEGER NOT NULL DEFAULT 0,
+    mate_in INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_mp_username ON mistake_puzzles(username);
-CREATE INDEX IF NOT EXISTS idx_mp_source ON mistake_puzzles(source);
-CREATE INDEX IF NOT EXISTS idx_mp_annotation ON mistake_puzzles(annotation);
-CREATE INDEX IF NOT EXISTS idx_mp_completed ON mistake_puzzles(completed);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mp_dedup ON mistake_puzzles(username, source, game_id, fen, played_move);
+CREATE TABLE IF NOT EXISTS analysis_metadata (
+    username TEXT NOT NULL,
+    source TEXT NOT NULL,
+    game_accuracy REAL NOT NULL DEFAULT 0,
+    total_moves_analyzed INTEGER NOT NULL DEFAULT 0,
+    date_analyzed TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(username, source)
+);
 ";
 
 fn ensure_table(conn: &rusqlite::Connection) -> Result<(), Error> {
@@ -364,6 +416,27 @@ fn ensure_table(conn: &rusqlite::Connection) -> Result<(), Error> {
         "ALTER TABLE mistake_puzzles ADD COLUMN predecessor_fen TEXT NOT NULL DEFAULT '';
          ALTER TABLE mistake_puzzles ADD COLUMN predecessor_move TEXT NOT NULL DEFAULT '';",
     );
+    // Migration: add miss columns
+    let _ = conn.execute_batch(
+        "ALTER TABLE mistake_puzzles ADD COLUMN is_miss INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE mistake_puzzles ADD COLUMN miss_opportunity_cp INTEGER NOT NULL DEFAULT 0;",
+    );
+    // Migration: add enhanced classification columns
+    let _ = conn.execute_batch(
+        "ALTER TABLE mistake_puzzles ADD COLUMN move_classification TEXT NOT NULL DEFAULT '';
+         ALTER TABLE mistake_puzzles ADD COLUMN miss_type TEXT NOT NULL DEFAULT '';
+         ALTER TABLE mistake_puzzles ADD COLUMN eval_delta INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE mistake_puzzles ADD COLUMN mate_in INTEGER NOT NULL DEFAULT 0;",
+    );
+    // Create indexes after all migrations are complete
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mp_username ON mistake_puzzles(username);
+         CREATE INDEX IF NOT EXISTS idx_mp_source ON mistake_puzzles(source);
+         CREATE INDEX IF NOT EXISTS idx_mp_annotation ON mistake_puzzles(annotation);
+         CREATE INDEX IF NOT EXISTS idx_mp_completed ON mistake_puzzles(completed);
+         CREATE INDEX IF NOT EXISTS idx_mp_is_miss ON mistake_puzzles(is_miss);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_mp_dedup ON mistake_puzzles(username, source, game_id, fen, played_move);",
+    )?;
     Ok(())
 }
 
@@ -433,6 +506,90 @@ fn classify_annotation(win_chance_drop: f64) -> &'static str {
     }
 }
 
+// ── Enhanced classification & miss detection ────────────────────────────────
+
+/// Extract mate-in count from engine score.
+/// Returns Some(n) where n > 0 means forced mate FOR side-to-move in n moves,
+/// n < 0 means opponent has forced mate.
+fn extract_mate_in(score: &vampirc_uci::uci::Score) -> Option<i32> {
+    use vampirc_uci::uci::ScoreValue;
+    match score.value {
+        ScoreValue::Mate(m) => Some(m),
+        _ => None,
+    }
+}
+
+/// Classify a move by centipawn eval delta (positive = player lost value).
+/// Returns one of: "BEST", "EXCELLENT", "GOOD", "INACCURACY", "MISTAKE", "BLUNDER", "MISS"
+fn classify_move_by_cp(
+    eval_delta: f64,
+    was_mate_available: bool,
+    is_mate_allowed_after: bool,
+) -> &'static str {
+    if was_mate_available       { return "MISS"; }
+    if is_mate_allowed_after    { return "BLUNDER"; }
+    if eval_delta <= 10.0       { return "BEST"; }
+    if eval_delta <= 25.0       { return "EXCELLENT"; }
+    if eval_delta <= 50.0       { return "GOOD"; }
+    if eval_delta <= 100.0      { return "INACCURACY"; }
+    if eval_delta <= 300.0      { return "MISTAKE"; }
+    "BLUNDER"
+}
+
+/// Map the new CP-based classification back to legacy annotation for backward compat.
+fn classification_to_annotation(classification: &str) -> &'static str {
+    match classification {
+        "MISS" => "miss",
+        "BLUNDER" => "??",
+        "MISTAKE" => "?",
+        "INACCURACY" => "?!",
+        _ => "",
+    }
+}
+
+/// Enhanced miss detection using the briefing's algorithm.
+/// Evaluates both mate-based misses and winning-opportunity misses.
+/// All evals are from the PLAYER's perspective (positive = good for player).
+///
+/// Returns (is_miss, miss_type, miss_opportunity_cp).
+fn detect_miss_enhanced(
+    best_eval_player_cp: f64,
+    eval_delta: f64,
+    best_mate_in: Option<i32>,
+    actual_move: &str,
+    best_move: &str,
+) -> (bool, &'static str, i32) {
+    // Player played the best move — no miss
+    if actual_move == best_move {
+        return (false, "", 0);
+    }
+
+    // Condition: Forced mate was available for the player and not played
+    if let Some(mate) = best_mate_in {
+        if mate > 0 {
+            return (true, "MATE_MISSED", 100_000);
+        }
+    }
+
+    // Condition: Large opportunity existed (player had ≥150cp advantage)
+    //            AND the advantage was wasted (eval delta ≥ 100cp)
+    let opportunity_threshold = 150.0;
+    let advantage_lost_threshold = 100.0;
+    if best_eval_player_cp >= opportunity_threshold && eval_delta >= advantage_lost_threshold {
+        return (true, "WINNING_OPPORTUNITY_MISSED", eval_delta as i32);
+    }
+
+    (false, "", 0)
+}
+
+/// Compute per-move accuracy from eval delta (centipawns).
+/// Uses Chess.com's publicly reverse-engineered formula.
+fn move_accuracy_from_delta(eval_delta: f64) -> f64 {
+    let cpl = eval_delta.max(0.0) / 100.0; // convert to pawns
+    let accuracy = 103.1668 * (-0.04354 * cpl).exp() - 3.1669;
+    accuracy.clamp(0.0, 100.0)
+}
+
 // ── Batch analysis command ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -486,6 +643,7 @@ pub async fn analyze_games_for_mistakes(
     );
 
     let mut pending_mistakes: Vec<PendingMistakePuzzle> = Vec::new();
+    let mut all_eval_deltas: Vec<f64> = Vec::new();
 
     if engine_type == "lichess" {
         // ── Cloud-only analysis via Lichess API ─────────────────────────
@@ -511,6 +669,7 @@ pub async fn analyze_games_for_mistakes(
                 &username,
                 &source,
                 min_win_chance_drop,
+                &mut all_eval_deltas,
                 |pos_fraction: f32| {
                     let overall = ((game_idx as f32 + pos_fraction) / total_games as f32) * 100.0;
                     let _ =
@@ -538,7 +697,7 @@ pub async fn analyze_games_for_mistakes(
         state.analysis_cancel_flags.remove(&id);
         update_progress(&state.progress_state, &app, id, 100.0, true)?;
     } else if engine_type == "hybrid" {
-        // ── Hybrid analysis: cloud → local engine fallback, parallel ────
+        // ── Hybrid analysis: cloud → shared local engine fallback ────
         let client = Arc::new(reqwest::Client::new());
         let rate_limiter = Arc::new(CloudRateLimiter::new());
         let fen_cache: FenCache = Arc::new(TokioMutex::new(HashMap::new()));
@@ -549,12 +708,145 @@ pub async fn analyze_games_for_mistakes(
         let games: Arc<Vec<GameRecord>> = Arc::new(games);
         let total_games_u32 = total_games as u32;
 
-        // Concurrency: up to 4 games at a time
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        // CRITICAL FIX: Single shared engine behind a mutex.
+        // Previously each of 4 parallel tasks spawned its own engine process,
+        // causing CPU saturation and system freeze on a 6-core CPU.
+        let shared_engine: SharedEngine = Arc::new(TokioMutex::new(None));
+
+        // Concurrency: up to 2 games at a time (reduced from 4).
+        // Cloud requests remain parallel; engine access is serialized via mutex.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
         let all_mistakes: Arc<TokioMutex<Vec<PendingMistakePuzzle>>> =
+            Arc::new(TokioMutex::new(Vec::new()));
+        let hybrid_eval_deltas: Arc<TokioMutex<Vec<f64>>> =
             Arc::new(TokioMutex::new(Vec::new()));
 
         let start_time = tokio::time::Instant::now();
+
+        // ── BATCH PRE-FETCH: Collect all unique FENs, then bulk cloud-lookup ──
+        // This mirrors how Lichess itself works: pure database lookups for most
+        // positions, engine only for rare positions not in the cloud DB.
+        {
+            let mut unique_fens: HashSet<String> = HashSet::new();
+
+            for game in games.iter() {
+                let initial_fen = game
+                    .fen
+                    .as_deref()
+                    .unwrap_or("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+                let fen_parsed: Result<Fen, _> = initial_fen.parse();
+                let Ok(fen_parsed) = fen_parsed else { continue };
+                let setup = fen_parsed.as_setup().clone();
+                let castling_mode = CastlingMode::detect(&setup);
+                let chess_result = Chess::from_setup(setup, castling_mode)
+                    .or_else(PositionError::ignore_too_much_material);
+                let Ok(mut chess) = chess_result else { continue };
+
+                let player_is_white = username.eq_ignore_ascii_case(&game.white);
+                let player_color = if player_is_white { Color::White } else { Color::Black };
+
+                let mut player_move_idx = 0i32;
+                for move_byte in iter_mainline_move_bytes(&game.moves) {
+                    let fen_before = Fen::from_position(chess.clone(), EnPassantMode::Legal);
+                    let turn_before = chess.turn();
+
+                    if let Some(m) = decode_move(move_byte, &chess) {
+                        let uci = UciMove::from_move(&m, castling_mode).to_string();
+
+                        if turn_before == player_color {
+                            player_move_idx += 1;
+                            if player_move_idx >= MIN_PLAYER_MOVE_NUMBER {
+                                // "Before" position (player to move)
+                                unique_fens.insert(fen_before.to_string());
+
+                                // "After" position (position after player's move)
+                                let mut chess_after = chess.clone();
+                                chess_after.play_unchecked(&m);
+                                let fen_after = Fen::from_position(chess_after, EnPassantMode::Legal);
+                                unique_fens.insert(fen_after.to_string());
+                            }
+                        }
+
+                        chess.play_unchecked(&m);
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let total_fens = unique_fens.len();
+            info!(
+                "Batch pre-fetch: {} unique FENs from {} games",
+                total_fens, total_games
+            );
+
+            // Fetch cloud evals for all unique FENs into the cache
+            let mut fetched = 0u32;
+            let mut cloud_found = 0u32;
+            for fen_str in &unique_fens {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                // Skip FENs already in cache (shouldn't happen on first run, but safe)
+                {
+                    let cache = fen_cache.lock().await;
+                    if cache.contains_key(fen_str) {
+                        fetched += 1;
+                        continue;
+                    }
+                }
+
+                // Cloud lookup only (no engine fallback during pre-fetch)
+                let cloud_result = fetch_cloud_eval_hybrid(
+                    &client, fen_str, 3, 16, &rate_limiter,
+                ).await;
+
+                if let Ok(Some(ref cloud_data)) = cloud_result {
+                    if !cloud_data.pvs.is_empty() {
+                        let score = cloud_pv_to_score(&cloud_data.pvs[0]);
+                        let best_uci = cloud_data.pvs[0]
+                            .moves
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        let best_line = cloud_data.pvs[0].moves.clone();
+
+                        let mut cache = fen_cache.lock().await;
+                        cache.insert(
+                            fen_str.clone(),
+                            CachedEval {
+                                best_uci,
+                                best_line,
+                                score,
+                                depth: cloud_data.depth,
+                            },
+                        );
+                        cloud_found += 1;
+                    }
+                }
+
+                fetched += 1;
+
+                // Emit progress during pre-fetch phase (0-50% of total progress)
+                if fetched % 50 == 0 || fetched == total_fens as u32 {
+                    let pct = (fetched as f32 / total_fens as f32) * 50.0;
+                    let _ = update_progress(
+                        &state.progress_state, &app, id.clone(), pct, false,
+                    );
+                }
+            }
+
+            info!(
+                "Batch pre-fetch complete: {}/{} FENs found in cloud ({:.1}% hit rate) in {:.1}s",
+                cloud_found,
+                total_fens,
+                if total_fens > 0 { cloud_found as f64 / total_fens as f64 * 100.0 } else { 0.0 },
+                start_time.elapsed().as_secs_f64()
+            );
+        }
 
         let mut handles = Vec::new();
 
@@ -566,6 +858,7 @@ pub async fn analyze_games_for_mistakes(
             let counters = counters.clone();
             let cancel = cancel_flag_clone.clone();
             let all_mistakes = all_mistakes.clone();
+            let hybrid_eval_deltas = hybrid_eval_deltas.clone();
             let games = games.clone();
             let username = username.clone();
             let source = source.clone();
@@ -575,6 +868,7 @@ pub async fn analyze_games_for_mistakes(
             let progress_state = state.progress_state.clone();
             let app_handle = app.clone();
             let progress_id = id.clone();
+            let shared_engine = shared_engine.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
@@ -598,17 +892,19 @@ pub async fn analyze_games_for_mistakes(
                     &uci_options,
                     min_win_chance_drop,
                     &cancel,
+                    &shared_engine,
                 )
                 .await;
 
                 match result {
-                    Ok(game_mistakes) => {
+                    Ok((game_mistakes, game_deltas)) => {
                         info!(
                             "Game {} (hybrid): found {} mistakes",
                             game.id,
                             game_mistakes.len()
                         );
                         all_mistakes.lock().await.extend(game_mistakes);
+                        hybrid_eval_deltas.lock().await.extend(game_deltas);
                     }
                     Err(e) => {
                         info!("Skipping game {} (hybrid): {}", game.id, e);
@@ -616,10 +912,11 @@ pub async fn analyze_games_for_mistakes(
                 }
 
                 let done = counters.games_done.fetch_add(1, Ordering::SeqCst) + 1;
-                let overall = (done as f32 / total_games_u32 as f32) * 100.0;
+                // Pre-fetch used 0-50%; per-game analysis uses 50-100%
+                let overall = 50.0 + (done as f32 / total_games_u32 as f32) * 50.0;
 
                 let elapsed_secs = start_time.elapsed().as_secs() as u32;
-                let est_left = if done > 0 {
+                let _est_left = if done > 0 {
                     let per_game = elapsed_secs as f64 / done as f64;
                     let remaining = total_games_u32.saturating_sub(done);
                     (per_game * remaining as f64) as u32
@@ -645,7 +942,17 @@ pub async fn analyze_games_for_mistakes(
             let _ = handle.await;
         }
 
+        // Cleanup shared engine
+        {
+            let mut engine_guard = shared_engine.lock().await;
+            if let Some((mut proc, _)) = engine_guard.take() {
+                proc.quit().await.ok();
+                info!("Shared hybrid engine process terminated cleanly.");
+            }
+        }
+
         pending_mistakes = all_mistakes.lock().await.clone();
+        all_eval_deltas = hybrid_eval_deltas.lock().await.clone();
 
         info!(
             "Hybrid analysis complete: {} games, {} cloud hits, {} engine analyzed, {} cache hits, {} mistakes",
@@ -671,8 +978,11 @@ pub async fn analyze_games_for_mistakes(
                 proc.set_option(&opt.name, &opt.value).await?;
             }
         }
-        // Force MultiPV=2
-        proc.set_option("MultiPV", "2").await?;
+        // Force MultiPV=3 for top 3 move analysis
+        proc.set_option("MultiPV", "3").await?;
+
+        // Track all eval deltas for game accuracy computation
+        let mut all_eval_deltas: Vec<f64> = Vec::new();
 
         for (game_idx, game) in games.iter().enumerate() {
             if cancel_flag.load(Ordering::SeqCst) {
@@ -696,6 +1006,7 @@ pub async fn analyze_games_for_mistakes(
                 &source,
                 &go_mode,
                 min_win_chance_drop,
+                &mut all_eval_deltas,
                 |pos_fraction: f32| {
                     let overall = ((game_idx as f32 + pos_fraction) / total_games as f32) * 100.0;
                     let _ =
@@ -738,6 +1049,52 @@ pub async fn analyze_games_for_mistakes(
 
     insert_pending_mistakes(&mistake_conn, &pending_mistakes)?;
 
+    // Log annotation distribution for debugging classification issues
+    {
+        let mut blunders = 0;
+        let mut mistakes = 0;
+        let mut inaccuracies = 0;
+        let mut misses_only = 0;
+        let mut misses_total = 0;
+        for p in &pending_mistakes {
+            match p.annotation.as_str() {
+                "??" => blunders += 1,
+                "?" => mistakes += 1,
+                "?!" => inaccuracies += 1,
+                "miss" => misses_only += 1,
+                _ => {}
+            }
+            if p.is_miss {
+                misses_total += 1;
+            }
+        }
+        info!(
+            "Annotation breakdown: {} blunders (??), {} mistakes (?), {} inaccuracies (?!), {} miss-only, {} total misses (including dual)",
+            blunders, mistakes, inaccuracies, misses_only, misses_total
+        );
+    }
+
+    // Compute and store game accuracy from all eval deltas
+    let game_accuracy = if !all_eval_deltas.is_empty() {
+        let sum: f64 = all_eval_deltas.iter().map(|d| move_accuracy_from_delta(*d)).sum();
+        (sum / all_eval_deltas.len() as f64).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    info!(
+        "Game accuracy: {:.1}% ({} total moves analyzed)",
+        game_accuracy,
+        all_eval_deltas.len()
+    );
+
+    // Store game accuracy in analysis_metadata table
+    let now = chrono::Utc::now().to_rfc3339();
+    mistake_conn.execute(
+        "INSERT OR REPLACE INTO analysis_metadata (username, source, game_accuracy, total_moves_analyzed, date_analyzed)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![&username, &source, game_accuracy, all_eval_deltas.len() as i32, &now],
+    )?;
+
     // Return stats
     get_stats_from_db(&mistake_conn, &username, &source)
 }
@@ -746,6 +1103,7 @@ pub async fn analyze_games_for_mistakes(
 
 use diesel::prelude::*;
 
+#[allow(dead_code)]
 struct GameRecord {
     id: i32,
     fen: Option<String>,
@@ -780,6 +1138,12 @@ struct PendingMistakePuzzle {
     date_analyzed: String,
     predecessor_fen: String,
     predecessor_move: String,
+    is_miss: bool,
+    miss_opportunity_cp: i32,
+    move_classification: String,
+    miss_type: String,
+    eval_delta: i32,
+    mate_in: i32,
 }
 
 fn insert_pending_mistakes(
@@ -793,8 +1157,9 @@ fn insert_pending_mistakes(
                 best_move, best_line, opponent_punishment, opponent_line,
                 annotation, cp_loss, win_chance_drop, eval_before, eval_after,
                 move_number, engine_depth, date_analyzed, completed,
-                predecessor_fen, predecessor_move
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19, ?20)",
+                predecessor_fen, predecessor_move, is_miss, miss_opportunity_cp,
+                move_classification, miss_type, eval_delta, mate_in
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             rusqlite::params![
                 &item.source,
                 &item.username,
@@ -816,6 +1181,12 @@ fn insert_pending_mistakes(
                 &item.date_analyzed,
                 &item.predecessor_fen,
                 &item.predecessor_move,
+                item.is_miss as i32,
+                item.miss_opportunity_cp,
+                &item.move_classification,
+                &item.miss_type,
+                item.eval_delta,
+                item.mate_in,
             ],
         )?;
     }
@@ -945,6 +1316,7 @@ async fn analyze_single_game(
     source: &str,
     go_mode: &GoMode,
     min_win_chance_drop: f64,
+    eval_deltas: &mut Vec<f64>,
     on_position_progress: impl Fn(f32),
 ) -> Result<Vec<PendingMistakePuzzle>, Error> {
     let initial_fen = game
@@ -1061,7 +1433,7 @@ async fn analyze_single_game(
                         let cur_depth = bm.depth;
                         if multipv as usize == current_batch.len() + 1 {
                             current_batch.push(bm);
-                            let expected = 2u16.min(
+                            let expected = 3u16.min(
                                 Fen::from_ascii(fen_before.to_string().as_bytes())
                                     .ok()
                                     .and_then(|f| {
@@ -1072,7 +1444,7 @@ async fn analyze_single_game(
                                             .ok()
                                     })
                                     .map(|p| p.legal_moves().len() as u16)
-                                    .unwrap_or(2),
+                                    .unwrap_or(3),
                             );
                             if multipv >= expected {
                                 if current_batch.iter().all(|x| x.depth == cur_depth)
@@ -1111,10 +1483,13 @@ async fn analyze_single_game(
         let eval_before_score = &best_lines[0].score;
         let eval_before_cp =
             score_from_player_perspective(eval_before_score, player_color, player_color);
+        let best_mate_in = extract_mate_in(eval_before_score);
 
         // Did the player play the engine's best move?
         if played_uci == &engine_best_uci {
-            continue; // Good move, skip
+            // Good move — record zero eval delta for accuracy computation
+            eval_deltas.push(0.0);
+            continue;
         }
 
         // We need to find the eval of the position AFTER the player's actual move.
@@ -1187,21 +1562,71 @@ async fn analyze_single_game(
         };
         let eval_after_cp =
             score_from_player_perspective(eval_after_score, opponent_color, player_color);
+        let after_mate_in = extract_mate_in(eval_after_score);
+
+        // Compute eval delta (centipawns lost by the player's move)
+        let eval_delta_f = (eval_before_cp - eval_after_cp).max(0.0);
+        let eval_delta_i = eval_delta_f as i32;
+
+        // Track eval delta for game accuracy computation
+        eval_deltas.push(eval_delta_f);
 
         let win_before = get_win_chance(eval_before_cp);
         let win_after = get_win_chance(eval_after_cp);
         let win_chance_drop = win_before - win_after;
+        let cp_loss = eval_delta_i;
 
-        if win_chance_drop < min_win_chance_drop {
-            continue;
-        }
+        // Enhanced miss detection
+        let (is_miss, miss_type, miss_opportunity_cp) = detect_miss_enhanced(
+            eval_before_cp,
+            eval_delta_f,
+            best_mate_in,
+            played_uci,
+            &engine_best_uci,
+        );
 
+        // CP-based move classification
+        let was_mate_available = best_mate_in.map_or(false, |m| m > 0);
+        let is_mate_allowed_after = after_mate_in.map_or(false, |m| m < 0);
+        let move_classification = classify_move_by_cp(eval_delta_f, was_mate_available, is_mate_allowed_after);
+        let mate_in_val = best_mate_in.unwrap_or(0);
+
+        // Legacy annotation (win-chance-drop based)
         let annotation = classify_annotation(win_chance_drop);
-        if annotation.is_empty() {
-            continue;
+
+        // Determine final annotation: use CP-based classification if it gives a result,
+        // otherwise fall back to win-chance annotation
+        let final_annotation = if is_miss && annotation.is_empty() {
+            "miss".to_string()
+        } else if !annotation.is_empty() {
+            annotation.to_string()
+        } else {
+            let cp_annotation = classification_to_annotation(move_classification);
+            if cp_annotation.is_empty() {
+                continue; // Neither system flagged this as notable
+            }
+            cp_annotation.to_string()
+        };
+
+        // Log every non-trivial eval drop for debugging classification issues
+        if win_chance_drop > 2.0 || is_miss {
+            info!(
+                "Local move {}: eval_before={:.0}cp eval_after={:.0}cp delta={}cp win_drop={:.1}% class={} annotation={} is_miss={} miss_type={}",
+                move_number, eval_before_cp, eval_after_cp, eval_delta_i, win_chance_drop,
+                move_classification,
+                if final_annotation.is_empty() { "none" } else { &final_annotation },
+                is_miss, miss_type
+            );
         }
 
-        let cp_loss = (eval_before_cp - eval_after_cp).max(0.0) as i32;
+        // Skip if below threshold AND not a miss
+        if win_chance_drop < min_win_chance_drop && !is_miss {
+            // Also check CP classification — if it's INACCURACY or worse, keep it
+            if !matches!(move_classification, "INACCURACY" | "MISTAKE" | "BLUNDER" | "MISS") {
+                continue;
+            }
+        }
+
         let engine_depth = last_depth as i32;
 
         // Opponent punishment: the best response after the bad move
@@ -1229,7 +1654,7 @@ async fn analyze_single_game(
             best_line: engine_best_line,
             opponent_punishment,
             opponent_line,
-            annotation: annotation.to_string(),
+            annotation: final_annotation,
             cp_loss,
             win_chance_drop,
             eval_before: format_eval(eval_before_score),
@@ -1239,6 +1664,12 @@ async fn analyze_single_game(
             date_analyzed: now.clone(),
             predecessor_fen: pred_fen.clone().unwrap_or_default(),
             predecessor_move: pred_move.clone().unwrap_or_default(),
+            is_miss,
+            miss_opportunity_cp,
+            move_classification: move_classification.to_string(),
+            miss_type: miss_type.to_string(),
+            eval_delta: eval_delta_i,
+            mate_in: mate_in_val,
         });
     }
 
@@ -1253,6 +1684,7 @@ async fn analyze_single_game_cloud(
     username: &str,
     source: &str,
     min_win_chance_drop: f64,
+    eval_deltas: &mut Vec<f64>,
     on_position_progress: impl Fn(f32),
 ) -> Result<Vec<PendingMistakePuzzle>, Error> {
     let initial_fen = game
@@ -1343,7 +1775,7 @@ async fn analyze_single_game_cloud(
         }
 
         // Fetch cloud eval for the position BEFORE the player's move
-        let before_eval = match fetch_cloud_eval(client, fen_str, 2).await? {
+        let before_eval = match fetch_cloud_eval(client, fen_str, 3).await? {
             Some(eval) => eval,
             None => continue, // Position not in cloud DB, skip
         };
@@ -1365,10 +1797,13 @@ async fn analyze_single_game_cloud(
         let eval_before_score = cloud_pv_to_score(&before_eval.pvs[0]);
         let eval_before_cp =
             score_from_player_perspective(&eval_before_score, player_color, player_color);
+        let best_mate_in = extract_mate_in(&eval_before_score);
 
         // Did the player play the cloud's best move?
         if played_uci == &cloud_best_uci {
-            continue; // Good move
+            // Good move — record zero eval delta for accuracy computation
+            eval_deltas.push(0.0);
+            continue;
         }
 
         // Compute FEN after the player's actual move
@@ -1399,21 +1834,69 @@ async fn analyze_single_game_cloud(
         let eval_after_score = cloud_pv_to_score(&after_eval.pvs[0]);
         let eval_after_cp =
             score_from_player_perspective(&eval_after_score, opponent_color, player_color);
+        let after_mate_in = extract_mate_in(&eval_after_score);
+
+        // Compute eval delta (centipawns lost)
+        let eval_delta_f = (eval_before_cp - eval_after_cp).max(0.0);
+        let eval_delta_i = eval_delta_f as i32;
+
+        // Track eval delta for game accuracy computation
+        eval_deltas.push(eval_delta_f);
 
         let win_before = get_win_chance(eval_before_cp);
         let win_after = get_win_chance(eval_after_cp);
         let win_chance_drop = win_before - win_after;
+        let cp_loss = eval_delta_i;
 
-        if win_chance_drop < min_win_chance_drop {
-            continue;
-        }
+        // Enhanced miss detection
+        let (is_miss, miss_type, miss_opportunity_cp) = detect_miss_enhanced(
+            eval_before_cp,
+            eval_delta_f,
+            best_mate_in,
+            played_uci,
+            &cloud_best_uci,
+        );
 
+        // CP-based move classification
+        let was_mate_available = best_mate_in.map_or(false, |m| m > 0);
+        let is_mate_allowed_after = after_mate_in.map_or(false, |m| m < 0);
+        let move_classification = classify_move_by_cp(eval_delta_f, was_mate_available, is_mate_allowed_after);
+        let mate_in_val = best_mate_in.unwrap_or(0);
+
+        // Legacy annotation
         let annotation = classify_annotation(win_chance_drop);
-        if annotation.is_empty() {
-            continue;
+
+        // Determine final annotation
+        let final_annotation = if is_miss && annotation.is_empty() {
+            "miss".to_string()
+        } else if !annotation.is_empty() {
+            annotation.to_string()
+        } else {
+            let cp_annotation = classification_to_annotation(move_classification);
+            if cp_annotation.is_empty() {
+                continue;
+            }
+            cp_annotation.to_string()
+        };
+
+        // Log every non-trivial eval drop for debugging
+        if win_chance_drop > 2.0 || is_miss {
+            info!(
+                "Cloud move {}: eval_before={:.0}cp eval_after={:.0}cp delta={}cp win_drop={:.1}% class={} annotation={} is_miss={} miss_type={}",
+                move_number, eval_before_cp, eval_after_cp, eval_delta_i, win_chance_drop,
+                move_classification,
+                if final_annotation.is_empty() { "none" } else { &final_annotation },
+                is_miss, miss_type
+            );
         }
 
-        let cp_loss = (eval_before_cp - eval_after_cp).max(0.0) as i32;
+        // Skip if below threshold AND not a miss AND not flagged by CP classification
+        if win_chance_drop < min_win_chance_drop && !is_miss {
+            if !matches!(move_classification, "INACCURACY" | "MISTAKE" | "BLUNDER" | "MISS") {
+                continue;
+            }
+        }
+
         let engine_depth = before_eval.depth as i32;
 
         // Opponent's best response after the bad move
@@ -1436,7 +1919,7 @@ async fn analyze_single_game_cloud(
             best_line: cloud_best_line,
             opponent_punishment,
             opponent_line,
-            annotation: annotation.to_string(),
+            annotation: final_annotation,
             cp_loss,
             win_chance_drop,
             eval_before: format_eval(&eval_before_score),
@@ -1446,13 +1929,19 @@ async fn analyze_single_game_cloud(
             date_analyzed: now.clone(),
             predecessor_fen: pred_fen.clone().unwrap_or_default(),
             predecessor_move: pred_move.clone().unwrap_or_default(),
+            is_miss,
+            miss_opportunity_cp,
+            move_classification: move_classification.to_string(),
+            miss_type: miss_type.to_string(),
+            eval_delta: eval_delta_i,
+            mate_in: mate_in_val,
         });
     }
 
     Ok(mistakes_found)
 }
 
-// ── Hybrid single-game analysis (cloud → local engine fallback) ─────────────
+// ── Hybrid single-game analysis (cloud → shared local engine fallback) ───────
 
 async fn analyze_single_game_hybrid(
     client: &reqwest::Client,
@@ -1467,7 +1956,8 @@ async fn analyze_single_game_hybrid(
     uci_options: &[EngineOption],
     min_win_chance_drop: f64,
     cancel_flag: &AtomicBool,
-) -> Result<Vec<PendingMistakePuzzle>, Error> {
+    shared_engine: &SharedEngine,
+) -> Result<(Vec<PendingMistakePuzzle>, Vec<f64>), Error> {
     let initial_fen = game
         .fen
         .as_deref()
@@ -1543,10 +2033,12 @@ async fn analyze_single_game_hybrid(
         .to_string();
 
     let mut mistakes_found: Vec<PendingMistakePuzzle> = Vec::new();
+    let mut game_eval_deltas: Vec<f64> = Vec::new();
     let now = chrono::Utc::now().to_rfc3339();
 
-    // Lazily spawn local engine only if needed
-    let mut local_engine: Option<(BaseEngine, EngineReader)> = None;
+    // Track the previous position's eval for legacy miss detection (E0/E1/E2).
+    // The enhanced miss detection (mate + opportunity based) is now primary.
+    let mut prev_eval_before_opponent_move: Option<f64> = None;
 
     for (pos_idx, (fen_str, played_uci, moves_before, pred_fen, pred_move)) in
         positions.iter().enumerate()
@@ -1564,385 +2056,352 @@ async fn analyze_single_game_hybrid(
 
         counters.positions_analyzed.fetch_add(1, Ordering::SeqCst);
 
-        // Step 0: Check FEN cache
-        {
-            let cache = fen_cache.lock().await;
-            if let Some(cached_before) = cache.get(fen_str) {
-                // We have a cache hit for the "before" position
-                let eval_before_cp =
-                    score_from_player_perspective(&cached_before.score, player_color, player_color);
-
-                if played_uci == &cached_before.best_uci {
+        // ── Helper: get eval for a FEN (cache → cloud → engine) ──
+        // Returns (best_uci, best_line, score, depth) or None
+        async fn get_eval_for_fen(
+            fen_str: &str,
+            moves_before: &[String],
+            initial_fen: &str,
+            multipv: u16,
+            client: &reqwest::Client,
+            rate_limiter: &CloudRateLimiter,
+            fen_cache: &FenCache,
+            counters: &HybridCounters,
+            shared_engine: &SharedEngine,
+            engine_path: &str,
+            go_mode: &GoMode,
+            uci_options: &[EngineOption],
+        ) -> Result<Option<(String, String, vampirc_uci::uci::Score, u32)>, Error> {
+            // Check cache first
+            {
+                let cache = fen_cache.lock().await;
+                if let Some(cached) = cache.get(fen_str) {
                     counters.cache_hits.fetch_add(1, Ordering::SeqCst);
-                    continue; // Good move
+                    return Ok(Some((
+                        cached.best_uci.clone(),
+                        cached.best_line.clone(),
+                        cached.score.clone(),
+                        cached.depth,
+                    )));
                 }
-
-                // Check if we have the "after" position cached too
-                let fen_after_str = compute_fen_after(fen_str, played_uci)?;
-                if let Some(cached_after) = cache.get(&fen_after_str) {
-                    let eval_after_cp = score_from_player_perspective(
-                        &cached_after.score,
-                        opponent_color,
-                        player_color,
-                    );
-                    let win_before = get_win_chance(eval_before_cp);
-                    let win_after = get_win_chance(eval_after_cp);
-                    let win_chance_drop = win_before - win_after;
-
-                    counters.cache_hits.fetch_add(1, Ordering::SeqCst);
-
-                    if win_chance_drop >= min_win_chance_drop {
-                        let annotation = classify_annotation(win_chance_drop);
-                        if !annotation.is_empty() {
-                            let cp_loss = (eval_before_cp - eval_after_cp).max(0.0) as i32;
-                            mistakes_found.push(PendingMistakePuzzle {
-                                source: source.to_string(),
-                                username: username.to_string(),
-                                game_id: game_id.clone(),
-                                fen: fen_str.clone(),
-                                player_color: color_str.to_string(),
-                                played_move: played_uci.clone(),
-                                best_move: cached_before.best_uci.clone(),
-                                best_line: cached_before.best_line.clone(),
-                                opponent_punishment: cached_after.best_uci.clone(),
-                                opponent_line: cached_after.best_line.clone(),
-                                annotation: annotation.to_string(),
-                                cp_loss,
-                                win_chance_drop,
-                                eval_before: format_eval(&cached_before.score),
-                                eval_after: format_eval(&cached_after.score),
-                                move_number,
-                                engine_depth: cached_before.depth as i32,
-                                date_analyzed: now.clone(),
-                                predecessor_fen: pred_fen.clone().unwrap_or_default(),
-                                predecessor_move: pred_move.clone().unwrap_or_default(),
-                            });
-                        }
-                    }
-                    continue;
-                }
-                // Only "before" was cached, fall through to analyze "after"
             }
-        }
 
-        // Step 1: Try Lichess Cloud Eval (min depth 20 for hybrid)
-        let cloud_result = fetch_cloud_eval_hybrid(client, fen_str, 2, 20, rate_limiter).await?;
+            // Try cloud (depth 16 is sufficient for detecting mistakes/blunders)
+            let cloud_result =
+                fetch_cloud_eval_hybrid(client, fen_str, multipv, 16, rate_limiter).await?;
+            if let Some(ref cloud_data) = cloud_result {
+                if !cloud_data.pvs.is_empty() {
+                    counters.cloud_hits.fetch_add(1, Ordering::SeqCst);
+                    let score = cloud_pv_to_score(&cloud_data.pvs[0]);
+                    let best_uci = cloud_data.pvs[0]
+                        .moves
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let best_line = cloud_data.pvs[0].moves.clone();
 
-        if let Some(ref cloud_data) = cloud_result {
-            if !cloud_data.pvs.is_empty() {
-                counters.cloud_hits.fetch_add(1, Ordering::SeqCst);
-
-                let eval_before_score = cloud_pv_to_score(&cloud_data.pvs[0]);
-                let eval_before_cp =
-                    score_from_player_perspective(&eval_before_score, player_color, player_color);
-
-                let cloud_best_uci = cloud_data.pvs[0]
-                    .moves
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let cloud_best_line = cloud_data.pvs[0].moves.clone();
-
-                // Cache the before eval
-                {
-                    let mut cache = fen_cache.lock().await;
-                    cache.insert(
-                        fen_str.clone(),
-                        CachedEval {
-                            best_uci: cloud_best_uci.clone(),
-                            best_line: cloud_best_line.clone(),
-                            score: eval_before_score.clone(),
-                            depth: cloud_data.depth,
-                        },
-                    );
-                }
-
-                if played_uci == &cloud_best_uci {
-                    continue; // Good move
-                }
-
-                // Get eval for position after the played move (also try cloud)
-                let fen_after_str = compute_fen_after(fen_str, played_uci)?;
-                let after_cloud =
-                    fetch_cloud_eval_hybrid(client, &fen_after_str, 1, 20, rate_limiter).await?;
-
-                if let Some(ref after_data) = after_cloud {
-                    if !after_data.pvs.is_empty() {
-                        let eval_after_score = cloud_pv_to_score(&after_data.pvs[0]);
-                        let eval_after_cp = score_from_player_perspective(
-                            &eval_after_score,
-                            opponent_color,
-                            player_color,
+                    // Cache it
+                    {
+                        let mut cache = fen_cache.lock().await;
+                        cache.insert(
+                            fen_str.to_string(),
+                            CachedEval {
+                                best_uci: best_uci.clone(),
+                                best_line: best_line.clone(),
+                                score: score.clone(),
+                                depth: cloud_data.depth,
+                            },
                         );
+                    }
 
-                        // Cache after eval
-                        {
-                            let mut cache = fen_cache.lock().await;
-                            cache.insert(
-                                fen_after_str,
-                                CachedEval {
-                                    best_uci: after_data.pvs[0]
-                                        .moves
-                                        .split_whitespace()
-                                        .next()
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    best_line: after_data.pvs[0].moves.clone(),
-                                    score: eval_after_score.clone(),
-                                    depth: after_data.depth,
-                                },
-                            );
-                        }
+                    return Ok(Some((best_uci, best_line, score, cloud_data.depth)));
+                }
+            }
 
-                        let win_before = get_win_chance(eval_before_cp);
-                        let win_after = get_win_chance(eval_after_cp);
-                        let win_chance_drop = win_before - win_after;
+            // Fall back to shared local engine (serialized access)
+            counters.engine_analyzed.fetch_add(1, Ordering::SeqCst);
+            let mut engine_guard = shared_engine.lock().await;
 
-                        if win_chance_drop >= min_win_chance_drop {
-                            let annotation = classify_annotation(win_chance_drop);
-                            if !annotation.is_empty() {
-                                let cp_loss = (eval_before_cp - eval_after_cp).max(0.0) as i32;
-                                let opponent_punishment = after_data.pvs[0]
-                                    .moves
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or("")
-                                    .to_string();
-                                let opponent_line = after_data.pvs[0].moves.clone();
-
-                                mistakes_found.push(PendingMistakePuzzle {
-                                    source: source.to_string(),
-                                    username: username.to_string(),
-                                    game_id: game_id.clone(),
-                                    fen: fen_str.clone(),
-                                    player_color: color_str.to_string(),
-                                    played_move: played_uci.clone(),
-                                    best_move: cloud_best_uci,
-                                    best_line: cloud_best_line,
-                                    opponent_punishment,
-                                    opponent_line,
-                                    annotation: annotation.to_string(),
-                                    cp_loss,
-                                    win_chance_drop,
-                                    eval_before: format_eval(&eval_before_score),
-                                    eval_after: format_eval(&eval_after_score),
-                                    move_number,
-                                    engine_depth: cloud_data.depth as i32,
-                                    date_analyzed: now.clone(),
-                                    predecessor_fen: pred_fen.clone().unwrap_or_default(),
-                                    predecessor_move: pred_move.clone().unwrap_or_default(),
-                                });
-                            }
-                        }
-                        continue; // Cloud handled both before+after
+            // Lazily spawn engine on first use
+            if engine_guard.is_none() {
+                info!("Spawning shared local engine for hybrid fallback: {}", engine_path);
+                let ep = PathBuf::from(engine_path);
+                let mut proc = BaseEngine::spawn(ep).await?;
+                proc.init_uci().await?;
+                let rdr = proc.take_reader().ok_or(Error::EngineDisconnected)?;
+                for opt in uci_options {
+                    if opt.name != "MultiPV" && opt.name != "UCI_Chess960" {
+                        proc.set_option(&opt.name, &opt.value).await?;
                     }
                 }
-                // Cloud had "before" but not "after" — fall through to local engine for "after"
+                proc.set_option("MultiPV", &multipv.to_string()).await?;
+                *engine_guard = Some((proc, rdr));
             }
-        }
+            let (ref mut proc, ref mut reader) = engine_guard.as_mut().unwrap();
 
-        // Step 2: Local engine fallback
-        counters.engine_analyzed.fetch_add(1, Ordering::SeqCst);
+            // Ensure MultiPV is set correctly for this call
+            proc.set_option("MultiPV", &multipv.to_string()).await?;
 
-        // Lazily spawn engine on first use
-        if local_engine.is_none() {
-            let ep = PathBuf::from(engine_path);
-            let mut proc = BaseEngine::spawn(ep).await?;
-            proc.init_uci().await?;
-            let rdr = proc.take_reader().ok_or(Error::EngineDisconnected)?;
-            for opt in uci_options {
-                if opt.name != "MultiPV" && opt.name != "UCI_Chess960" {
-                    proc.set_option(&opt.name, &opt.value).await?;
-                }
-            }
-            proc.set_option("MultiPV", "2").await?;
-            local_engine = Some((proc, rdr));
-        }
-        let (ref mut proc, ref mut reader) = local_engine.as_mut().unwrap();
+            proc.set_position(initial_fen, moves_before).await?;
+            proc.go(go_mode).await?;
 
-        // Analyze "before" position with local engine
-        proc.set_position(initial_fen, moves_before).await?;
-        proc.go(go_mode).await?;
+            let mut best_lines: Vec<BestMoves> = Vec::new();
+            let mut current_batch: Vec<BestMoves> = Vec::new();
+            let mut last_depth = 0u32;
 
-        let mut best_lines: Vec<BestMoves> = Vec::new();
-        let mut current_batch: Vec<BestMoves> = Vec::new();
-        let mut last_depth = 0u32;
-
-        while let Ok(Some(line)) = reader.next_line().await {
-            match parse_one(&line) {
-                UciMessage::Info(attrs) => {
-                    if let Ok(bm) = parse_uci_attrs(attrs, &fen_str.parse()?, moves_before) {
-                        if bm.score.lower_bound == Some(true) || bm.score.upper_bound == Some(true)
-                        {
-                            continue;
-                        }
-                        let multipv = bm.multipv;
-                        let cur_depth = bm.depth;
-                        if multipv as usize == current_batch.len() + 1 {
-                            current_batch.push(bm);
-                            let expected = 2u16.min(
-                                Fen::from_ascii(fen_str.as_bytes())
-                                    .ok()
-                                    .and_then(|f| {
-                                        let s = f.into_setup();
-                                        let cm = CastlingMode::detect(&s);
-                                        Chess::from_setup(s, cm)
-                                            .or_else(PositionError::ignore_too_much_material)
-                                            .ok()
-                                    })
-                                    .map(|p| p.legal_moves().len() as u16)
-                                    .unwrap_or(2),
-                            );
-                            if multipv >= expected {
-                                if current_batch.iter().all(|x| x.depth == cur_depth)
-                                    && cur_depth >= last_depth
-                                {
-                                    best_lines = current_batch.clone();
-                                    last_depth = cur_depth;
+            while let Ok(Some(line)) = reader.next_line().await {
+                match parse_one(&line) {
+                    UciMessage::Info(attrs) => {
+                        if let Ok(bm) = parse_uci_attrs(attrs, &fen_str.parse()?, moves_before) {
+                            if bm.score.lower_bound == Some(true)
+                                || bm.score.upper_bound == Some(true)
+                            {
+                                continue;
+                            }
+                            let mpv = bm.multipv;
+                            let cur_depth = bm.depth;
+                            if mpv as usize == current_batch.len() + 1 {
+                                current_batch.push(bm);
+                                let expected = multipv.min(
+                                    Fen::from_ascii(fen_str.as_bytes())
+                                        .ok()
+                                        .and_then(|f| {
+                                            let s = f.into_setup();
+                                            let cm = CastlingMode::detect(&s);
+                                            Chess::from_setup(s, cm)
+                                                .or_else(
+                                                    PositionError::ignore_too_much_material,
+                                                )
+                                                .ok()
+                                        })
+                                        .map(|p| p.legal_moves().len() as u16)
+                                        .unwrap_or(multipv),
+                                );
+                                if mpv >= expected {
+                                    if current_batch.iter().all(|x| x.depth == cur_depth)
+                                        && cur_depth >= last_depth
+                                    {
+                                        best_lines = current_batch.clone();
+                                        last_depth = cur_depth;
+                                    }
+                                    current_batch.clear();
                                 }
-                                current_batch.clear();
                             }
                         }
                     }
+                    UciMessage::BestMove { .. } => break,
+                    _ => {}
                 }
-                UciMessage::BestMove { .. } => break,
-                _ => {}
             }
+
+            // Release engine lock before returning
+            drop(engine_guard);
+
+            if best_lines.is_empty() {
+                return Ok(None);
+            }
+
+            let best_uci = best_lines
+                .first()
+                .and_then(|b| b.uci_moves.first())
+                .cloned()
+                .unwrap_or_default();
+            let best_line = best_lines
+                .first()
+                .map(|b| b.uci_moves.join(" "))
+                .unwrap_or_default();
+            let score = best_lines[0].score.clone();
+
+            // Cache
+            {
+                let mut cache = fen_cache.lock().await;
+                cache.insert(
+                    fen_str.to_string(),
+                    CachedEval {
+                        best_uci: best_uci.clone(),
+                        best_line: best_line.clone(),
+                        score: score.clone(),
+                        depth: last_depth,
+                    },
+                );
+            }
+
+            Ok(Some((best_uci, best_line, score, last_depth)))
         }
 
-        if best_lines.is_empty() {
-            continue;
-        }
+        // ── Get eval BEFORE player's move ──
+        let before_result = get_eval_for_fen(
+            fen_str,
+            moves_before,
+            initial_fen,
+            3, // MultiPV 3 for top 3 moves
+            client,
+            rate_limiter,
+            fen_cache,
+            counters,
+            shared_engine,
+            engine_path,
+            go_mode,
+            uci_options,
+        )
+        .await?;
 
-        let engine_best_uci = best_lines
-            .first()
-            .and_then(|b| b.uci_moves.first())
-            .cloned()
-            .unwrap_or_default();
-        let engine_best_line = best_lines
-            .first()
-            .map(|b| b.uci_moves.join(" "))
-            .unwrap_or_default();
+        let (engine_best_uci, engine_best_line, eval_before_score, before_depth) =
+            match before_result {
+                Some(r) => r,
+                None => continue,
+            };
 
-        let eval_before_score = &best_lines[0].score;
         let eval_before_cp =
-            score_from_player_perspective(eval_before_score, player_color, player_color);
+            score_from_player_perspective(&eval_before_score, player_color, player_color);
+        let best_mate_in = extract_mate_in(&eval_before_score);
 
-        // Cache the before eval
-        {
-            let mut cache = fen_cache.lock().await;
-            cache.insert(
-                fen_str.clone(),
-                CachedEval {
-                    best_uci: engine_best_uci.clone(),
-                    best_line: engine_best_line.clone(),
-                    score: eval_before_score.clone(),
-                    depth: last_depth,
-                },
-            );
-        }
-
+        // Did the player play the engine's best move?
         if played_uci == &engine_best_uci {
+            // Good move — record zero eval delta for accuracy and update prev eval
+            game_eval_deltas.push(0.0);
+            prev_eval_before_opponent_move = Some(eval_before_cp);
             continue;
         }
 
-        // Analyze "after" position
-        let mut moves_after_played = moves_before.clone();
-        moves_after_played.push(played_uci.clone());
-
-        proc.set_position(initial_fen, &moves_after_played).await?;
-        proc.go(go_mode).await?;
-
+        // ── Get eval AFTER player's move ──
+        // Use reduced engine depth for "after" positions — we only need the eval
+        // confirmation, not full analysis. Cloud evals are still used at normal depth.
         let fen_after_str = compute_fen_after(fen_str, played_uci)?;
+        let mut moves_after = moves_before.to_vec();
+        moves_after.push(played_uci.clone());
 
-        let mut after_lines: Vec<BestMoves> = Vec::new();
-        let mut current_batch2: Vec<BestMoves> = Vec::new();
-        let mut last_depth2 = 0u32;
+        let after_go_mode = GoMode::Depth(8); // Reduced depth for after-position engine fallback
+        let after_result = get_eval_for_fen(
+            &fen_after_str,
+            &moves_after,
+            initial_fen,
+            1,
+            client,
+            rate_limiter,
+            fen_cache,
+            counters,
+            shared_engine,
+            engine_path,
+            &after_go_mode,
+            uci_options,
+        )
+        .await?;
 
-        while let Ok(Some(line)) = reader.next_line().await {
-            match parse_one(&line) {
-                UciMessage::Info(attrs) => {
-                    if let Ok(bm) = parse_uci_attrs(attrs, &fen_after_str.parse()?, &[]) {
-                        if bm.score.lower_bound == Some(true) || bm.score.upper_bound == Some(true)
-                        {
-                            continue;
-                        }
-                        let multipv = bm.multipv;
-                        let cur_depth = bm.depth;
-                        if multipv as usize == current_batch2.len() + 1 {
-                            current_batch2.push(bm);
-                            if multipv >= 1 {
-                                if current_batch2.iter().all(|x| x.depth == cur_depth)
-                                    && cur_depth >= last_depth2
-                                {
-                                    after_lines = current_batch2.clone();
-                                    last_depth2 = cur_depth;
-                                }
-                                current_batch2.clear();
-                            }
-                        }
-                    }
-                }
-                UciMessage::BestMove { .. } => break,
-                _ => {}
-            }
-        }
+        let (after_best_uci, after_best_line, eval_after_score, _after_depth) =
+            match after_result {
+                Some(r) => r,
+                None => continue,
+            };
 
-        if after_lines.is_empty() {
-            continue;
-        }
-
-        let eval_after_score = &after_lines[0].score;
         let eval_after_cp =
-            score_from_player_perspective(eval_after_score, opponent_color, player_color);
+            score_from_player_perspective(&eval_after_score, opponent_color, player_color);
+        let after_mate_in = extract_mate_in(&eval_after_score);
 
-        // Cache after eval
-        {
-            let mut cache = fen_cache.lock().await;
-            cache.insert(
-                fen_after_str,
-                CachedEval {
-                    best_uci: after_lines
-                        .first()
-                        .and_then(|b| b.uci_moves.first())
-                        .cloned()
-                        .unwrap_or_default(),
-                    best_line: after_lines
-                        .first()
-                        .map(|b| b.uci_moves.join(" "))
-                        .unwrap_or_default(),
-                    score: eval_after_score.clone(),
-                    depth: last_depth2,
-                },
-            );
-        }
+        // Compute eval delta (centipawns lost by the player's move)
+        let eval_delta_f = (eval_before_cp - eval_after_cp).max(0.0);
+        let eval_delta_i = eval_delta_f as i32;
+
+        // Track eval delta for game accuracy computation
+        game_eval_deltas.push(eval_delta_f);
 
         let win_before = get_win_chance(eval_before_cp);
         let win_after = get_win_chance(eval_after_cp);
         let win_chance_drop = win_before - win_after;
+        let cp_loss = eval_delta_i;
 
-        if win_chance_drop < min_win_chance_drop {
-            continue;
+        // ── Enhanced miss detection ──
+        // Primary: mate-based + opportunity-based (from briefing)
+        let (enhanced_miss, enhanced_miss_type, enhanced_miss_cp) = detect_miss_enhanced(
+            eval_before_cp,
+            eval_delta_f,
+            best_mate_in,
+            played_uci,
+            &engine_best_uci,
+        );
+
+        // Secondary: legacy E0/E1/E2 miss detection (opponent blundered, player didn't capitalize)
+        let mut legacy_miss = false;
+        if let Some(e0) = prev_eval_before_opponent_move {
+            let opportunity = eval_before_cp - e0;
+            let given_back = eval_before_cp - eval_after_cp;
+            if opportunity >= 100.0 && given_back >= 30.0 {
+                legacy_miss = true;
+            }
         }
 
+        // Combine: either detection method flags a miss
+        let is_miss = enhanced_miss || legacy_miss;
+        let miss_type = if enhanced_miss {
+            enhanced_miss_type
+        } else if legacy_miss {
+            "WINNING_OPPORTUNITY_MISSED"
+        } else {
+            ""
+        };
+        let miss_opportunity_cp = if enhanced_miss {
+            enhanced_miss_cp
+        } else if legacy_miss {
+            eval_delta_i
+        } else {
+            0
+        };
+
+        if is_miss {
+            info!(
+                "Move {}: MISS detected — type={}, eval_before={:.0}cp eval_after={:.0}cp delta={}cp",
+                move_number, miss_type, eval_before_cp, eval_after_cp, eval_delta_i
+            );
+        }
+
+        // CP-based move classification
+        let was_mate_available = best_mate_in.map_or(false, |m| m > 0);
+        let is_mate_allowed_after = after_mate_in.map_or(false, |m| m < 0);
+        let move_classification = classify_move_by_cp(eval_delta_f, was_mate_available, is_mate_allowed_after);
+        let mate_in_val = best_mate_in.unwrap_or(0);
+
+        // Legacy annotation (win-chance-drop based)
         let annotation = classify_annotation(win_chance_drop);
-        if annotation.is_empty() {
+
+        // Log every non-trivial eval drop for debugging
+        if win_chance_drop > 2.0 || is_miss {
+            info!(
+                "Hybrid move {}: eval_before={:.0}cp eval_after={:.0}cp delta={}cp win_drop={:.1}% class={} annotation={} is_miss={} miss_type={}",
+                move_number, eval_before_cp, eval_after_cp, eval_delta_i, win_chance_drop,
+                move_classification,
+                if annotation.is_empty() { "none" } else { annotation },
+                is_miss, miss_type
+            );
+        }
+
+        // Decide whether to create a puzzle:
+        // - Standard mistakes: win_chance_drop >= threshold AND annotation non-empty
+        // - Miss: detected by enhanced or legacy algorithm
+        // - CP-based: classification is INACCURACY or worse
+        let is_standard_mistake =
+            win_chance_drop >= min_win_chance_drop && !annotation.is_empty();
+        let is_cp_notable = matches!(move_classification, "INACCURACY" | "MISTAKE" | "BLUNDER" | "MISS");
+
+        if !is_standard_mistake && !is_miss && !is_cp_notable {
+            prev_eval_before_opponent_move = Some(eval_before_cp);
             continue;
         }
 
-        let cp_loss = (eval_before_cp - eval_after_cp).max(0.0) as i32;
-        let engine_depth = last_depth as i32;
+        // Determine final annotation
+        let final_annotation = if is_miss && annotation.is_empty() && !is_cp_notable {
+            "miss".to_string()
+        } else if !annotation.is_empty() {
+            annotation.to_string()
+        } else if is_miss {
+            "miss".to_string()
+        } else {
+            classification_to_annotation(move_classification).to_string()
+        };
 
-        let opponent_punishment = after_lines
-            .first()
-            .and_then(|b| b.uci_moves.first())
-            .cloned()
-            .unwrap_or_default();
-        let opponent_line = after_lines
-            .first()
-            .map(|b| b.uci_moves.join(" "))
-            .unwrap_or_default();
+        let engine_depth = before_depth as i32;
+        let opponent_punishment = after_best_uci;
+        let opponent_line = after_best_line;
 
         mistakes_found.push(PendingMistakePuzzle {
             source: source.to_string(),
@@ -1955,25 +2414,31 @@ async fn analyze_single_game_hybrid(
             best_line: engine_best_line,
             opponent_punishment,
             opponent_line,
-            annotation: annotation.to_string(),
+            annotation: final_annotation,
             cp_loss,
             win_chance_drop,
-            eval_before: format_eval(eval_before_score),
-            eval_after: format_eval(eval_after_score),
+            eval_before: format_eval(&eval_before_score),
+            eval_after: format_eval(&eval_after_score),
             move_number,
             engine_depth,
             date_analyzed: now.clone(),
             predecessor_fen: pred_fen.clone().unwrap_or_default(),
             predecessor_move: pred_move.clone().unwrap_or_default(),
+            is_miss,
+            miss_opportunity_cp,
+            move_classification: move_classification.to_string(),
+            miss_type: miss_type.to_string(),
+            eval_delta: eval_delta_i,
+            mate_in: mate_in_val,
         });
+
+        // Update prev eval for next iteration
+        prev_eval_before_opponent_move = Some(eval_after_cp);
     }
 
-    // Cleanup local engine if it was spawned
-    if let Some((mut proc, _)) = local_engine {
-        proc.quit().await.ok();
-    }
+    // No local engine cleanup here — shared engine is cleaned up by the caller
 
-    Ok(mistakes_found)
+    Ok((mistakes_found, game_eval_deltas))
 }
 
 /// Compute the FEN after applying a single UCI move to a position.
@@ -2004,7 +2469,9 @@ pub fn get_mistake_puzzles(
         "SELECT id, source, username, game_id, fen, player_color, played_move,
                 best_move, best_line, opponent_punishment, opponent_line,
                 annotation, cp_loss, win_chance_drop, eval_before, eval_after,
-                move_number, engine_depth, date_analyzed, completed
+                move_number, engine_depth, date_analyzed, completed,
+                is_miss, miss_opportunity_cp,
+                move_classification, miss_type, eval_delta, mate_in
          FROM mistake_puzzles WHERE username = ?1",
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(filter.username.clone())];
@@ -2063,6 +2530,12 @@ pub fn get_mistake_puzzles(
                 engine_depth: row.get(17)?,
                 date_analyzed: row.get(18)?,
                 completed: row.get(19)?,
+                is_miss: row.get(20)?,
+                miss_opportunity_cp: row.get(21)?,
+                move_classification: row.get(22)?,
+                miss_type: row.get(23)?,
+                eval_delta: row.get(24)?,
+                mate_in: row.get(25)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -2133,6 +2606,10 @@ fn get_stats_from_db(
         "SELECT COUNT(*) FROM mistake_puzzles {} AND annotation = '?!'",
         base_where
     );
+    let misses_sql = format!(
+        "SELECT COUNT(*) FROM mistake_puzzles {} AND is_miss = 1",
+        base_where
+    );
 
     let query = |sql: &str| -> Result<i64, Error> {
         if source.is_empty() {
@@ -2149,11 +2626,30 @@ fn get_stats_from_db(
     let blunders = query(&blunders_sql)?;
     let mistakes = query(&mistakes_sql)?;
     let inaccuracies = query(&inaccuracies_sql)?;
+    let misses = query(&misses_sql)?;
 
     let accuracy = if solved_correct + solved_wrong > 0 {
         (solved_correct as f64 / (solved_correct + solved_wrong) as f64) * 100.0
     } else {
         0.0
+    };
+
+    // Get game accuracy from analysis_metadata table
+    let game_accuracy = {
+        let ga_result: Result<f64, _> = if source.is_empty() {
+            conn.query_row(
+                "SELECT game_accuracy FROM analysis_metadata WHERE username = ?1 LIMIT 1",
+                rusqlite::params![username],
+                |r| r.get(0),
+            )
+        } else {
+            conn.query_row(
+                "SELECT game_accuracy FROM analysis_metadata WHERE username = ?1 AND source = ?2",
+                rusqlite::params![username, source],
+                |r| r.get(0),
+            )
+        };
+        ga_result.unwrap_or(0.0)
     };
 
     Ok(MistakeStats {
@@ -2164,7 +2660,9 @@ fn get_stats_from_db(
         blunders,
         mistakes,
         inaccuracies,
+        misses,
         accuracy,
+        game_accuracy,
     })
 }
 
@@ -2226,9 +2724,10 @@ CREATE TABLE IF NOT EXISTS puzzle_themes (
 
 fn rating_from_annotation(annotation: &str) -> i32 {
     match annotation {
-        "??" => 1000, // Blunders are often obvious to spot
-        "?" => 1400,  // Mistakes require moderate skill
-        "?!" => 1800, // Inaccuracies are subtle
+        "??" => 1000,   // Blunders are often obvious to spot
+        "?" => 1400,    // Mistakes require moderate skill
+        "?!" => 1800,   // Inaccuracies are subtle
+        "miss" => 1200, // Missed opportunities — often tactical
         _ => 1500,
     }
 }
@@ -2245,7 +2744,7 @@ pub fn export_mistakes_to_puzzle_db(
 
     // Read all mistakes with predecessor info + fen for fallback
     let mut stmt = mistake_conn.prepare(
-        "SELECT predecessor_fen, predecessor_move, best_line, annotation, fen, opponent_punishment, opponent_line
+        "SELECT predecessor_fen, predecessor_move, best_line, annotation, fen, opponent_punishment, opponent_line, is_miss
          FROM mistake_puzzles
          WHERE username = ?1 AND source = ?2
          ORDER BY id ASC",
@@ -2259,6 +2758,7 @@ pub fn export_mistakes_to_puzzle_db(
         fen: String,
         opponent_punishment: String,
         opponent_line: String,
+        is_miss: bool,
     }
 
     let rows: Vec<ExportRow> = stmt
@@ -2271,6 +2771,7 @@ pub fn export_mistakes_to_puzzle_db(
                 fen: row.get(4)?,
                 opponent_punishment: row.get(5)?,
                 opponent_line: row.get(6)?,
+                is_miss: row.get::<_, i32>(7)? != 0,
             })
         })?
         .filter_map(|r| r.ok())
@@ -2282,7 +2783,7 @@ pub fn export_mistakes_to_puzzle_db(
     puzzle_conn.execute_batch(CREATE_PUZZLE_TABLES)?;
 
     // Insert themes
-    let theme_names = ["blunder", "mistake", "inaccuracy", "my-mistakes"];
+    let theme_names = ["blunder", "mistake", "inaccuracy", "miss", "my-mistakes"];
     for name in &theme_names {
         puzzle_conn.execute(
             "INSERT OR IGNORE INTO themes (name) VALUES (?1)",
@@ -2301,6 +2802,7 @@ pub fn export_mistakes_to_puzzle_db(
     let blunder_theme_id = get_theme_id("blunder")?;
     let mistake_theme_id = get_theme_id("mistake")?;
     let inaccuracy_theme_id = get_theme_id("inaccuracy")?;
+    let miss_theme_id = get_theme_id("miss")?;
     let my_mistakes_theme_id = get_theme_id("my-mistakes")?;
 
     // Clear existing puzzles (re-export replaces all)
@@ -2387,12 +2889,21 @@ pub fn export_mistakes_to_puzzle_db(
             "??" => Some(blunder_theme_id),
             "?" => Some(mistake_theme_id),
             "?!" => Some(inaccuracy_theme_id),
+            "miss" => Some(miss_theme_id),
             _ => None,
         };
         if let Some(tid) = annotation_theme_id {
             puzzle_conn.execute(
                 "INSERT OR IGNORE INTO puzzle_themes (puzzle_id, theme_id) VALUES (?1, ?2)",
                 rusqlite::params![puzzle_id, tid],
+            )?;
+        }
+
+        // Also link to miss theme if it's a miss (can be both mistake + miss)
+        if row.is_miss && row.annotation != "miss" {
+            puzzle_conn.execute(
+                "INSERT OR IGNORE INTO puzzle_themes (puzzle_id, theme_id) VALUES (?1, ?2)",
+                rusqlite::params![puzzle_id, miss_theme_id],
             )?;
         }
 

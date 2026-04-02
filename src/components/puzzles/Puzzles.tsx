@@ -81,11 +81,12 @@ function Puzzles({ id }: { id: string }) {
 
   const [settingsOpened, setSettingsOpened] = useState(false);
 
+  // Re-scan puzzle databases whenever the selected DB changes (e.g., after export)
   useEffect(() => {
     getPuzzleDatabases().then((databases) => {
       setPuzzleDbs(databases);
     });
-  }, []);
+  }, [selectedDb]);
 
   // Track whether we should auto-generate a puzzle once DBs load
   const autoGenTriggered = useRef(false);
@@ -195,8 +196,11 @@ function Puzzles({ id }: { id: string }) {
 
   // Auto-generate first puzzle when a DB is selected and no puzzles are loaded
   useEffect(() => {
-    if (selectedDb && puzzles.length === 0 && puzzleDbs.length > 0 && !autoGenTriggered.current) {
-      if (puzzleDbs.some((db) => db.path === selectedDb)) {
+    if (selectedDb && puzzles.length === 0 && !autoGenTriggered.current) {
+      // Either the DB is in the scanned list, or it was just set by the
+      // learn-from-mistakes export flow. Try generating directly.
+      const dbKnown = puzzleDbs.some((db) => db.path === selectedDb);
+      if (dbKnown || puzzleDbs.length > 0) {
         autoGenTriggered.current = true;
         generatePuzzle(selectedDb, true);
       }

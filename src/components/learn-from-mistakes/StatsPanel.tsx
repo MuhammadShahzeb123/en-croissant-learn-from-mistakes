@@ -18,7 +18,7 @@ export default function StatsPanel({ stats }: StatsPanelProps) {
   return (
     <Card withBorder shadow="sm" radius="md" p="md">
       <Group justify="space-between" align="flex-start">
-        <SimpleGrid cols={4} spacing="md" style={{ flex: 1 }}>
+        <SimpleGrid cols={5} spacing="md" style={{ flex: 1 }}>
           <StatItem
             label={t("LearnFromMistakes.TotalPuzzles")}
             value={stats.total.toString()}
@@ -42,9 +42,40 @@ export default function StatsPanel({ stats }: StatsPanelProps) {
             color="yellow"
             sublabel="?!"
           />
+          <StatItem
+            label={t("LearnFromMistakes.Miss", { defaultValue: "Missed Opportunity" })}
+            value={stats.misses.toString()}
+            color="cyan"
+          />
         </SimpleGrid>
 
         <Group gap="md">
+          {stats.gameAccuracy > 0 && (
+            <>
+              <RingProgress
+                size={80}
+                thickness={8}
+                roundCaps
+                sections={[
+                  { value: stats.gameAccuracy, color: "blue" },
+                  { value: 100 - stats.gameAccuracy, color: "gray.3" },
+                ]}
+                label={
+                  <Text ta="center" size="xs" fw={700}>
+                    {stats.gameAccuracy.toFixed(1)}%
+                  </Text>
+                }
+              />
+              <Stack gap={2}>
+                <Text size="xs" c="dimmed">
+                  {t("LearnFromMistakes.GameAccuracy", { defaultValue: "Game Accuracy" })}
+                </Text>
+                <Text size="xs" c="dimmed">
+                  Chess.com-style
+                </Text>
+              </Stack>
+            </>
+          )}
           <RingProgress
             size={80}
             thickness={8}
@@ -61,7 +92,7 @@ export default function StatsPanel({ stats }: StatsPanelProps) {
           />
           <Stack gap={2}>
             <Text size="xs" c="dimmed">
-              {t("LearnFromMistakes.Accuracy")}
+              {t("LearnFromMistakes.PuzzleAccuracy", { defaultValue: "Puzzle Accuracy" })}
             </Text>
             <Text size="xs" c="green">
               {t("LearnFromMistakes.Correct")}: {stats.solvedCorrect}

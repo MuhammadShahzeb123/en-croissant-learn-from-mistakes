@@ -40,10 +40,10 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
   const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
   const [selectedEngine, setSelectedEngine] = useState<string | null>(null);
   const [selectedHybridEngine, setSelectedHybridEngine] = useState<string | null>(null);
-  const [depth, setDepth] = useState<number>(18);
-  const [threads, setThreads] = useState<number>(1);
-  const [hash, setHash] = useState<number>(128);
-  const [annotations, setAnnotations] = useState<string[]>(["??", "?", "?!"]);
+  const [depth, setDepth] = useState<number>(10);
+  const [threads, setThreads] = useState<number>(6);
+  const [hash, setHash] = useState<number>(256);
+  const [annotations, setAnnotations] = useState<string[]>(["??", "?", "?!", "miss"]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -294,16 +294,16 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
               </Text>
               <Slider
                 min={8}
-                max={30}
+                max={20}
                 step={1}
                 value={depth}
                 onChange={setDepth}
                 marks={[
+                  { value: 8, label: "8" },
                   { value: 10, label: "10" },
-                  { value: 15, label: "15" },
+                  { value: 14, label: "14" },
+                  { value: 18, label: "18" },
                   { value: 20, label: "20" },
-                  { value: 25, label: "25" },
-                  { value: 30, label: "30" },
                 ]}
               />
             </div>
@@ -346,6 +346,7 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
             <Checkbox value="??" label={`${t("Annotate.Blunder")} (??)`} />
             <Checkbox value="?" label={`${t("Annotate.Mistake")} (?)`} />
             <Checkbox value="?!" label={`${t("Annotate.Dubious")} (?!)`} />
+            <Checkbox value="miss" label={t("LearnFromMistakes.Miss", { defaultValue: "Missed Opportunity" })} />
           </Group>
         </Checkbox.Group>
 
