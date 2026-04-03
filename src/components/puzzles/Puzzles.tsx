@@ -177,7 +177,10 @@ function Puzzles({ id }: { id: string }) {
         setRatingRange([rating + 50, rating + 100]);
       }
     }
-    const res = await commands.getPuzzle(db, range[0], range[1], effectiveSelectedTheme);
+    const isMistakesDb = db.includes("my_mistakes");
+    const effRange = isMistakesDb ? [0, 5000] : range;
+
+    const res = await commands.getPuzzle(db, effRange[0], effRange[1], effectiveSelectedTheme);
     const puzzle = unwrap(res);
     const newPuzzle: Puzzle = {
       ...puzzle,
@@ -429,7 +432,7 @@ function Puzzles({ id }: { id: string }) {
                       max={2800}
                       value={ratingRange}
                       onChange={setRatingRange}
-                      disabled={progressive}
+                      disabled={progressive || (selectedDb?.includes("my_mistakes") ?? false)}
                       marks={[
                         { value: 600, label: "600" },
                         { value: 1700, label: "1700" },

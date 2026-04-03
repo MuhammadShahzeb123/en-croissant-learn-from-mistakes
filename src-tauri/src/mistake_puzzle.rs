@@ -2525,7 +2525,7 @@ async fn analyze_single_game_hybrid(
             fen_str,
             moves_before,
             initial_fen,
-            3, // MultiPV 3 for top 3 moves
+            1, // MultiPV 1 (requesting 3 causes Lichess Cloud 404 misses on standard depth-cached positions!)
             client,
             rate_limiter,
             fen_cache,
