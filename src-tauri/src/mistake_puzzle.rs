@@ -1689,7 +1689,7 @@ async fn analyze_single_game(
             match parse_one(&line) {
                 UciMessage::Info(attrs) => {
                     if let Ok(bm) =
-                        parse_uci_attrs(attrs, &fen_before.to_string().parse()?, moves_before)
+                        parse_uci_attrs(attrs, &fen_before.to_string().parse()?, &[])
                     {
                         if bm.score.lower_bound == Some(true) || bm.score.upper_bound == Some(true)
                         {
@@ -2443,7 +2443,7 @@ async fn analyze_single_game_hybrid(
             while let Ok(Some(line)) = reader.next_line().await {
                 match parse_one(&line) {
                     UciMessage::Info(attrs) => {
-                        if let Ok(bm) = parse_uci_attrs(attrs, &fen_str.parse()?, moves_before) {
+                        if let Ok(bm) = parse_uci_attrs(attrs, &fen_str.parse()?, &[]) {
                             if bm.score.lower_bound == Some(true)
                                 || bm.score.upper_bound == Some(true)
                             {

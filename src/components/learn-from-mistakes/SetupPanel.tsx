@@ -38,7 +38,7 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
   const engines = useAtomValue(enginesAtom);
 
   const [selectedAccount, setSelectedAccount] = useState<string | null>(null);
-  const [selectedEngine, setSelectedEngine] = useState<string | null>(null);
+  const [selectedEngine, setSelectedEngine] = useState<string | null>(HYBRID_VALUE);
   const [selectedHybridEngine, setSelectedHybridEngine] = useState<string | null>(null);
   const [depth, setDepth] = useState<number>(10);
   const [threads, setThreads] = useState<number>(6);
@@ -75,6 +75,14 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
   // When engine selection changes, load its stored settings as defaults
   const activeEnginePath = isHybridEngine ? selectedHybridEngine : selectedEngine;
   const selectedLocalEngine = localEngines.find((e: LocalEngine) => e.path === activeEnginePath);
+
+  // Set the default hybrid fallback engine to the first local engine if not set
+  useEffect(() => {
+    if (isHybridEngine && !selectedHybridEngine && localEngines.length > 0) {
+      setSelectedHybridEngine(localEngines[0].path);
+    }
+  }, [isHybridEngine, localEngines, selectedHybridEngine]);
+
   useEffect(() => {
     if (!selectedLocalEngine?.settings) return;
     for (const s of selectedLocalEngine.settings) {

@@ -59,7 +59,7 @@ export default function LearnFromMistakes() {
           />
         )}
 
-        {stats && stats.total > 0 && view === "setup" && (
+        {stats && view === "setup" && (
           <StatsPanel stats={stats} />
         )}
       </Stack>
