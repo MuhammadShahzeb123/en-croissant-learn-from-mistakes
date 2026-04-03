@@ -631,6 +631,8 @@ fn read_mistakes_from_pgn(path: &str) -> Result<(Vec<MistakePuzzle>, AnalysisMet
                 game_id: get("GameId"),
                 fen: get("FEN"),
                 player_color: get("PlayerColor"),
+                white_player: get("WhitePlayer"),
+                black_player: get("BlackPlayer"),
                 played_move: get("PlayedMove"),
                 best_move: get("BestMove"),
                 best_line: get("BestLine"),

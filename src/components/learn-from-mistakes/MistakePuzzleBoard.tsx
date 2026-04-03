@@ -33,13 +33,15 @@ import { makeFen, parseFen } from "chessops/fen";
 import { useTranslation } from "react-i18next";
 import { Chessground } from "@/chessground/Chessground";
 import { commands } from "@/bindings";
-import type { MistakePuzzle, MistakeStats } from "@/bindings";
+import type { MistakePuzzle, MistakeStats, Score } from "@/bindings";
 import { positionFromFen } from "@/utils/chessops";
 import classes from "@/styles/Chessboard.module.css";
 import { type AnalysisConfig, enginesAtom } from "@/state/atoms";
 import { useAtomValue } from "jotai";
 import { invoke } from "@tauri-apps/api/core";
 import PromotionModal from "../boards/PromotionModal";
+import EvalBar from "../boards/EvalBar";
+import { events } from "@/bindings";
 
 type PuzzleMode = "find_correct" | "punish_mistake";
 type PuzzleState = "solving" | "correct" | "incorrect" | "revealed";
@@ -66,6 +68,7 @@ export default function MistakePuzzleBoard({
   const [userMove, setUserMove] = useState<string | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [playbackFen, setPlaybackFen] = useState<string | null>(null);
+  const [score, setScore] = useState<Score | null>(null);
   const engines = useAtomValue(enginesAtom);
 
   const filteredPuzzles = useMemo(() => {
@@ -341,6 +344,37 @@ export default function MistakePuzzleBoard({
 
   const displayFen = playbackFen || (puzzleState === "correct" || puzzleState === "incorrect" ? fenAfterUserMove : puzzleFen) || "";
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    const localEngine = engines?.find((e: any) => e.loaded && e.type === "local");
+
+    const setupListener = async () => {
+      unlisten = await events.bestMovesPayload.listen(({ payload }) => {
+        if (payload.tab === "mistake_puzzle" && payload.fen === displayFen && payload.bestLines.length > 0) {
+          setScore(payload.bestLines[0].score);
+        }
+      });
+    };
+    setupListener();
+
+    if (localEngine && displayFen) {
+      commands
+        .getBestMoves("mistake_engine", localEngine.id as string, "mistake_puzzle", { t: "Infinite" }, {
+          fen: displayFen,
+          moves: [],
+          extraOptions: [],
+        })
+        .catch(console.error);
+    }
+
+    return () => {
+      if (unlisten) unlisten();
+      if (localEngine) {
+        commands.stopEngine(localEngine.id as string, "mistake_puzzle").catch(console.error);
+      }
+    };
+  }, [displayFen, engines]);
+
   return (
     <Stack gap="md" style={{ flex: 1, minHeight: 0 }}>
       {/* Mode toggle */}
@@ -371,12 +405,15 @@ export default function MistakePuzzleBoard({
         {/* Board */}
         <Box
           w="100%"
-          style={{ flex: 1, minHeight: 0, maxWidth: 600 }}
+          style={{ flex: 1, minHeight: 0, maxWidth: 640, display: "flex", gap: "12px", height: "100%" }}
           ref={parentRef}
         >
+          <Box style={{ height: "100%" }}>
+            <EvalBar score={score} orientation={orientation} />
+          </Box>
           <Box
             className={classes.chessboard}
-            style={{ maxWidth: parentHeight }}
+            style={{ maxWidth: parentHeight, flex: 1 }}
           >
             <PromotionModal
               pendingMove={pendingMove}
@@ -434,7 +471,21 @@ export default function MistakePuzzleBoard({
             {puzzle && (
               <Group justify="center" mb={0}>
                 <Text size="sm" fw={700}>
-                  {puzzle.whitePlayer} <Text span c="dimmed">vs</Text> {puzzle.blackPlayer}
+                  {puzzle.whitePlayer}{" "}
+                  {puzzle.whitePlayer.toLowerCase() === config.username.toLowerCase() && (
+                    <Text span c="green">
+                      (You)
+                    </Text>
+                  )}{" "}
+                  <Text span c="dimmed">
+                    vs
+                  </Text>{" "}
+                  {puzzle.blackPlayer}{" "}
+                  {puzzle.blackPlayer.toLowerCase() === config.username.toLowerCase() && (
+                    <Text span c="green">
+                      (You)
+                    </Text>
+                  )}
                 </Text>
               </Group>
             )}
