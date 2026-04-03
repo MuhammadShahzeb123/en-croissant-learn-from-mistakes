@@ -19,6 +19,7 @@ import {
   IconBulb,
   IconEye,
   IconRotate,
+  IconPlayerPlay,
 } from "@tabler/icons-react";
 import {
   type Move,
@@ -35,7 +36,9 @@ import { commands } from "@/bindings";
 import type { MistakePuzzle, MistakeStats } from "@/bindings";
 import { positionFromFen } from "@/utils/chessops";
 import classes from "@/styles/Chessboard.module.css";
-import type { AnalysisConfig } from "@/state/atoms";
+import { type AnalysisConfig, enginesAtom } from "@/state/atoms";
+import { useAtomValue } from "jotai";
+import { invoke } from "@tauri-apps/api/core";
 import PromotionModal from "../boards/PromotionModal";
 
 type PuzzleMode = "find_correct" | "punish_mistake";
@@ -58,9 +61,12 @@ export default function MistakePuzzleBoard({
   const [currentIndex, setCurrentIndex] = useState(0);
   const [mode, setMode] = useState<PuzzleMode>("find_correct");
   const [puzzleState, setPuzzleState] = useState<PuzzleState>("solving");
-  const [hintSquare, setHintSquare] = useState<string | null>(null);
+  const [hintLevel, setHintLevel] = useState(0);
   const [pendingMove, setPendingMove] = useState<NormalMove | null>(null);
   const [userMove, setUserMove] = useState<string | null>(null);
+  const [isEvaluating, setIsEvaluating] = useState(false);
+  const [playbackFen, setPlaybackFen] = useState<string | null>(null);
+  const engines = useAtomValue(enginesAtom);
 
   const filteredPuzzles = useMemo(() => {
     return puzzles.filter((p) => config.annotationFilter.includes(p.annotation));
@@ -108,9 +114,10 @@ export default function MistakePuzzleBoard({
 
   function resetPuzzleState() {
     setPuzzleState("solving");
-    setHintSquare(null);
+    setHintLevel(0);
     setUserMove(null);
     setPendingMove(null);
+    setPlaybackFen(null);
   }
 
   function goToNextPuzzle() {
@@ -147,7 +154,7 @@ export default function MistakePuzzleBoard({
   }
 
   async function checkMove(move: Move) {
-    if (!pos || !expectedMove || puzzleState !== "solving") return;
+    if (!pos || !expectedMove || puzzleState !== "solving" || isEvaluating) return;
 
     const uci = makeUci(move);
     setUserMove(uci);
@@ -158,6 +165,30 @@ export default function MistakePuzzleBoard({
         await updateCompletion(true);
       }
     } else {
+      const localEngine = engines?.find(e => e.loaded && e.type === "local");
+      if (localEngine && puzzleFen) {
+        setIsEvaluating(true);
+        try {
+          const res = await invoke("evaluate_puzzle_move_alternative", {
+            enginePath: (localEngine as any).path,
+            fenBefore: puzzleFen,
+            uciMove: uci
+          }) as { cpLoss: number, isAcceptable: boolean };
+          
+          if (res.isAcceptable) {
+            setPuzzleState("correct");
+            if (puzzle?.completed === 0) {
+              await updateCompletion(true);
+            }
+            setIsEvaluating(false);
+            return;
+          }
+        } catch (e) {
+          console.error("Dynamic evaluation failed", e);
+        }
+        setIsEvaluating(false);
+      }
+
       setPuzzleState("incorrect");
       if (puzzle?.completed === 0) {
         await updateCompletion(false);
@@ -167,12 +198,43 @@ export default function MistakePuzzleBoard({
 
   function showHint() {
     if (!expectedMove) return;
-    const from = expectedMove.substring(0, 2);
-    setHintSquare(from);
+    setHintLevel((l) => (l < 2 ? l + 1 : 2));
   }
 
   function revealSolution() {
     setPuzzleState("revealed");
+    setPlaybackFen(null);
+  }
+
+  async function autoPlayContinuation() {
+    if (!puzzle || !puzzleFen) return;
+    const lineStr = mode === "find_correct" ? puzzle.bestLine : puzzle.opponentLine;
+    if (!lineStr) return;
+    
+    // We update state to revealed so arrows from incorrect move disappear
+    setPuzzleState("revealed");
+
+    const moves = lineStr.split(" ").filter(s => s.length >= 4);
+    let currFen = puzzleFen;
+    let posObj = positionFromFen(currFen)[0];
+    
+    setPlaybackFen(currFen);
+    
+    for (const uci of moves) {
+      if (!posObj) break;
+      const move = parseUci(uci);
+      if (!move) break;
+      
+      const newPos = posObj.clone();
+      newPos.play(move);
+      currFen = makeFen(newPos.toSetup());
+      posObj = newPos;
+      
+      await new Promise((r) => setTimeout(r, 600));
+      // Only proceed if we haven't reset the puzzle state in the meantime
+      if (!document.body.contains(parentRef.current)) return;
+      setPlaybackFen(currFen);
+    }
   }
 
   // Annotation badge color
@@ -240,13 +302,16 @@ export default function MistakePuzzleBoard({
 
   // Build auto shapes for hints and solution display
   const autoShapes: any[] = [];
-  if (hintSquare && puzzleState === "solving") {
-    autoShapes.push({
-      orig: hintSquare,
-      brush: "green",
-    });
+  if (hintLevel > 0 && expectedMove && puzzleState === "solving") {
+    const from = expectedMove.substring(0, 2);
+    if (hintLevel === 1) {
+      autoShapes.push({ orig: from, brush: "green" });
+    } else {
+      const to = expectedMove.substring(2, 4);
+      autoShapes.push({ orig: from, dest: to, brush: "green" });
+    }
   }
-  if ((puzzleState === "revealed" || puzzleState === "incorrect") && expectedMove) {
+  if ((puzzleState === "revealed" || puzzleState === "incorrect") && expectedMove && !playbackFen) {
     const from = expectedMove.substring(0, 2);
     const to = expectedMove.substring(2, 4);
     autoShapes.push({
@@ -264,6 +329,17 @@ export default function MistakePuzzleBoard({
       brush: "red",
     });
   }
+
+  const fenAfterUserMove = useMemo(() => {
+    if (!pos || !userMove) return null;
+    const newPos = pos.clone();
+    const move = parseUci(userMove);
+    if (!move) return null;
+    newPos.play(move);
+    return makeFen(newPos.toSetup());
+  }, [pos, userMove]);
+
+  const displayFen = playbackFen || (puzzleState === "correct" || puzzleState === "incorrect" ? fenAfterUserMove : puzzleFen) || "";
 
   return (
     <Stack gap="md" style={{ flex: 1, minHeight: 0 }}>
@@ -345,7 +421,7 @@ export default function MistakePuzzleBoard({
                 },
               }}
               turnColor={turn}
-              fen={puzzleFen || ""}
+              fen={displayFen}
               check={pos?.isCheck()}
             />
           </Box>
@@ -354,6 +430,15 @@ export default function MistakePuzzleBoard({
         {/* Info panel */}
         <Card withBorder shadow="sm" radius="md" p="md" w={320}>
           <Stack gap="sm">
+            {/* Player Info */}
+            {puzzle && (
+              <Group justify="center" mb={0}>
+                <Text size="sm" fw={700}>
+                  {puzzle.whitePlayer} <Text span c="dimmed">vs</Text> {puzzle.blackPlayer}
+                </Text>
+              </Group>
+            )}
+
             {/* Puzzle info */}
             <Group justify="space-between">
               <Text size="sm" fw={600}>
@@ -362,6 +447,7 @@ export default function MistakePuzzleBoard({
                   total: filteredPuzzles.length,
                 })}
               </Text>
+              {isEvaluating && <Badge color="gray" variant="dot">Evaluating...</Badge>}
               <Badge color={getAnnotationColor(puzzle?.annotation || "")}>
                 {getAnnotationLabel(puzzle?.annotation || "")} ({puzzle?.annotation})
               </Badge>
@@ -369,6 +455,17 @@ export default function MistakePuzzleBoard({
 
             {/* Miss type badge */}
             {getMissTypeBadge(puzzle)}
+
+            {/* Context Message */}
+            {mode === "find_correct" && puzzle && (
+              <Card p="xs" bg="dark.6" withBorder>
+                <Text size="sm">
+                  {t("LearnFromMistakes.ContextMessage", {
+                    defaultValue: `You played ${puzzle.playedMove} (${puzzle.annotation}). Find the better move!`
+                  })}
+                </Text>
+              </Card>
+            )}
 
             {/* Classification badge */}
             {puzzle?.moveClassification && (
@@ -425,11 +522,6 @@ export default function MistakePuzzleBoard({
             {(puzzleState === "incorrect" || puzzleState === "revealed") && puzzle && (
               <Card withBorder p="xs" bg="dark.6">
                 <Stack gap={4}>
-                  {mode === "find_correct" && (
-                    <Text size="xs" c="red">
-                      {t("LearnFromMistakes.YouPlayed")}: {puzzle.playedMove}
-                    </Text>
-                  )}
                   <Text size="xs" c="green">
                     {t("LearnFromMistakes.BestMove")}: {expectedMove}
                   </Text>
@@ -444,7 +536,7 @@ export default function MistakePuzzleBoard({
                   variant="light"
                   size="lg"
                   onClick={showHint}
-                  disabled={puzzleState !== "solving"}
+                  disabled={puzzleState !== "solving" || hintLevel >= 2}
                 >
                   <IconBulb size={18} />
                 </ActionIcon>
@@ -457,6 +549,16 @@ export default function MistakePuzzleBoard({
                   disabled={puzzleState === "correct" || puzzleState === "revealed"}
                 >
                   <IconEye size={18} />
+                </ActionIcon>
+              </Tooltip>
+              <Tooltip label={t("LearnFromMistakes.AutoPlayContinuation", { defaultValue: "Autoplay Continuation" })}>
+                <ActionIcon
+                  variant="light"
+                  size="lg"
+                  onClick={autoPlayContinuation}
+                  disabled={puzzleState === "solving"}
+                >
+                  <IconPlayerPlay size={18} />
                 </ActionIcon>
               </Tooltip>
               <Tooltip label={t("LearnFromMistakes.RetryPuzzle")}>

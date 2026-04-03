@@ -306,6 +306,8 @@ pub struct MistakePuzzle {
     pub game_id: String,
     pub fen: String,
     pub player_color: String,
+    pub white_player: String,
+    pub black_player: String,
     pub played_move: String,
     pub best_move: String,
     pub best_line: String,
@@ -423,6 +425,8 @@ fn write_mistakes_to_pgn(
         writeln!(pgn, "[Username \"{}\"]", pgn_escape(&item.username)).unwrap();
         writeln!(pgn, "[GameId \"{}\"]", pgn_escape(&item.game_id)).unwrap();
         writeln!(pgn, "[PlayerColor \"{}\"]", pgn_escape(&item.player_color)).unwrap();
+        writeln!(pgn, "[WhitePlayer \"{}\"]", pgn_escape(&item.white_player)).unwrap();
+        writeln!(pgn, "[BlackPlayer \"{}\"]", pgn_escape(&item.black_player)).unwrap();
         writeln!(pgn, "[PlayedMove \"{}\"]", pgn_escape(&item.played_move)).unwrap();
         writeln!(pgn, "[BestMove \"{}\"]", pgn_escape(&item.best_move)).unwrap();
         writeln!(pgn, "[BestLine \"{}\"]", pgn_escape(&item.best_line)).unwrap();
@@ -562,6 +566,8 @@ fn read_mistakes_from_pgn(path: &str) -> Result<(Vec<MistakePuzzle>, AnalysisMet
                         game_id: get("GameId"),
                         fen: get("FEN"),
                         player_color: get("PlayerColor"),
+                        white_player: get("WhitePlayer"),
+                        black_player: get("BlackPlayer"),
                         played_move: get("PlayedMove"),
                         best_move: get("BestMove"),
                         best_line: get("BestLine"),
@@ -1381,6 +1387,8 @@ pub async fn analyze_games_for_mistakes(
             game_id: p.game_id.clone(),
             fen: p.fen.clone(),
             player_color: p.player_color.clone(),
+            white_player: p.white_player.clone(),
+            black_player: p.black_player.clone(),
             played_move: p.played_move.clone(),
             best_move: p.best_move.clone(),
             best_line: p.best_line.clone(),
@@ -1432,6 +1440,8 @@ struct PendingMistakePuzzle {
     game_id: String,
     fen: String,
     player_color: String,
+    white_player: String,
+    black_player: String,
     played_move: String,
     best_move: String,
     best_line: String,
@@ -1911,6 +1921,8 @@ async fn analyze_single_game(
             game_id: game_id.clone(),
             fen: fen_str,
             player_color: color_str.to_string(),
+            white_player: game.white.clone(),
+            black_player: game.black.clone(),
             played_move: played_uci.clone(),
             best_move: engine_best_uci,
             best_line: engine_best_line,
@@ -2182,6 +2194,8 @@ async fn analyze_single_game_cloud(
             game_id: game_id.clone(),
             fen: fen_str.clone(),
             player_color: color_str.to_string(),
+            white_player: game.white.clone(),
+            black_player: game.black.clone(),
             played_move: played_uci.clone(),
             best_move: cloud_best_uci,
             best_line: cloud_best_line,
@@ -2702,6 +2716,8 @@ async fn analyze_single_game_hybrid(
             game_id: game_id.clone(),
             fen: fen_str.clone(),
             player_color: color_str.to_string(),
+            white_player: game.white.clone(),
+            black_player: game.black.clone(),
             played_move: played_uci.clone(),
             best_move: engine_best_uci,
             best_line: engine_best_line,
@@ -2972,10 +2988,12 @@ pub fn export_mistakes_to_puzzle_db(
         //   Compute FEN after player's bad move (opponent to move).
         //   moves = [opponent_punishment, player's best response...]
         //   The puzzle becomes: "opponent punishes your mistake — find the defense"
+        let best_move = row.best_line.split_whitespace().next().unwrap_or_default();
+
         let (puzzle_fen, puzzle_moves) =
             if !row.predecessor_fen.is_empty() && !row.predecessor_move.is_empty() {
                 // Standard: predecessor FEN + opponent's move + best continuation
-                let moves = format!("{} {}", row.predecessor_move, row.best_line);
+                let moves = format!("{} {}", row.predecessor_move, best_move);
                 (row.predecessor_fen.clone(), moves)
             } else if !row.opponent_punishment.is_empty() && !row.best_line.is_empty() {
                 // Fallback: compute FEN after player's bad move, use opponent's
@@ -2984,7 +3002,7 @@ pub fn export_mistakes_to_puzzle_db(
                     Ok(fen_after_mistake) => {
                         // fen_after_mistake has opponent to move — correct for puzzle format
                         // moves: opponent_punishment (auto-played), then best reply from best_line
-                        let moves = format!("{} {}", row.opponent_punishment, row.best_line);
+                        let moves = format!("{} {}", row.opponent_punishment, best_move);
                         (fen_after_mistake, moves)
                     }
                     Err(e) => {
@@ -3072,4 +3090,114 @@ pub fn export_mistakes_to_puzzle_db(
     drop(puzzle_conn);
 
     Ok(exported)
+}
+
+#[derive(Debug, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AlternativeEvalResult {
+    pub cp_loss: f64,
+    pub is_acceptable: bool,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn evaluate_puzzle_move_alternative(
+    engine_path: String,
+    fen_before: String,
+    uci_move: String,
+) -> Result<AlternativeEvalResult, Error> {
+    let client = reqwest::Client::new();
+    let rate_limiter = CloudRateLimiter::new();
+    
+    // 1. Evaluate fen_before
+    let mut best_cp = 0.0;
+    let mut use_cloud = false;
+    
+    if let Ok(Some(cloud_res)) = fetch_cloud_eval_hybrid(&client, &fen_before, 1, 10, &rate_limiter).await {
+        if !cloud_res.pvs.is_empty() {
+             best_cp = score_from_player_perspective(&cloud_pv_to_score(&cloud_res.pvs[0]), Color::White, Color::White);
+             use_cloud = true;
+        }
+    }
+    
+    let fen_after = compute_fen_after(&fen_before, &uci_move)?;
+    let mut actual_cp = 0.0;
+
+    // Try cloud for after as well
+    let mut after_cloud_success = false;
+    if let Ok(Some(cloud_res)) = fetch_cloud_eval_hybrid(&client, &fen_after, 1, 10, &rate_limiter).await {
+        if !cloud_res.pvs.is_empty() {
+             actual_cp = score_from_player_perspective(&cloud_pv_to_score(&cloud_res.pvs[0]), Color::White, Color::White);
+             after_cloud_success = true;
+        }
+    }
+
+    // Fall back to local engine if cloud missed either
+    if !use_cloud || !after_cloud_success {
+        if PathBuf::from(&engine_path).exists() {
+            let mut p = BaseEngine::spawn(PathBuf::from(&engine_path)).await?;
+            p.init_uci().await?;
+            if let Some(mut reader) = p.take_reader() {
+                if !use_cloud {
+                    p.set_position(&fen_before, &[]).await?;
+                    p.go(&GoMode::Depth(12)).await?;
+                    
+                    let mut last_depth = 0;
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        match vampirc_uci::parse_one(&line) {
+                            UciMessage::Info(attrs) => {
+                                if let Ok(bm) = parse_uci_attrs(attrs, &fen_before.parse()?, &[]) {
+                                    if bm.depth >= last_depth {
+                                        best_cp = score_from_player_perspective(&bm.score, Color::White, Color::White);
+                                        last_depth = bm.depth;
+                                    }
+                                }
+                            }
+                            UciMessage::BestMove { .. } => break,
+                            _ => {}
+                        }
+                    }
+                }
+
+                if !after_cloud_success {
+                    p.set_position(&fen_after, &[]).await?;
+                    p.go(&GoMode::Depth(12)).await?;
+                    
+                    let mut last_depth = 0;
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        match vampirc_uci::parse_one(&line) {
+                            UciMessage::Info(attrs) => {
+                                if let Ok(bm) = parse_uci_attrs(attrs, &fen_after.parse()?, &[]) {
+                                    if bm.depth >= last_depth {
+                                        actual_cp = score_from_player_perspective(&bm.score, Color::White, Color::White);
+                                        last_depth = bm.depth;
+                                    }
+                                }
+                            }
+                            UciMessage::BestMove { .. } => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // cp loss is the difference. The evaluations are normalized to white's absolute perspective,
+    // but wait! If fen_before is black's turn, we must negate to get the active player's cp!
+    let is_black = fen_before.split_whitespace().nth(1).unwrap_or("w") == "b";
+    
+    let mut cp_loss = if is_black {
+        actual_cp - best_cp
+    } else {
+        best_cp - actual_cp
+    };
+    
+    cp_loss = cp_loss.max(0.0);
+    
+    // Accept if loss <= 50cp
+    Ok(AlternativeEvalResult {
+        cp_loss,
+        is_acceptable: cp_loss <= 50.0,
+    })
 }

@@ -8,7 +8,8 @@ import { useAtom, useAtomValue } from "jotai";
 import { useContext, useState } from "react";
 import { useStore } from "zustand";
 import { Chessground } from "@/chessground/Chessground";
-import { jumpToNextPuzzleAtom, moveHighlightAtom, showCoordinatesAtom } from "@/state/atoms";
+import { enginesAtom, jumpToNextPuzzleAtom, moveHighlightAtom, showCoordinatesAtom } from "@/state/atoms";
+import { invoke } from "@tauri-apps/api/core";
 import classes from "@/styles/Chessboard.module.css";
 import { positionFromFen } from "@/utils/chessops";
 import type { Completion, Puzzle } from "@/utils/puzzles";
@@ -46,6 +47,8 @@ function PuzzleBoard({
     puzzle = puzzles[currentPuzzle];
   }
   const [ended, setEnded] = useState(false);
+  const [isEvaluating, setIsEvaluating] = useState(false);
+  const engines = useAtomValue(enginesAtom);
 
   const [pos] = positionFromFen(currentNode.fen);
 
@@ -100,6 +103,47 @@ function PuzzleBoard({
         changeHeaders: false,
       });
     } else {
+      const isMistakesDb = db?.includes("my_mistakes") ?? false;
+      const isMiss = puzzle.themes?.includes("miss") ?? false;
+      const localEngine = engines?.find(e => e.loaded && e.type === "local");
+
+      if (isMistakesDb && !ended && !isMiss && localEngine && !isEvaluating) {
+        setIsEvaluating(true);
+        try {
+          const res = await invoke("evaluate_puzzle_move_alternative", {
+            enginePath: (localEngine as any).path,
+            fenBefore: currentNode.fen,
+            uciMove: uci
+          }) as { cpLoss: number, isAcceptable: boolean };
+          
+          if (res.isAcceptable) {
+            if (currentMove === puzzle.moves.length - 1 || puzzle.moves.length <= 2) {
+              if (puzzle.completion !== "incorrect") {
+                await changeCompletion("correct");
+              }
+              setEnded(false);
+              setIsEvaluating(false);
+
+              if (db && jumpToNextPuzzleImmediately) {
+                await generatePuzzle(db);
+                reset();
+                return;
+              }
+            }
+            makeMove({
+              payload: move,
+              changePosition: false,
+              changeHeaders: false,
+            });
+            reset();
+            return;
+          }
+        } catch (e) {
+          console.error("Dynamic evaluation failed", e);
+        }
+        setIsEvaluating(false);
+      }
+
       makeMove({
         payload: move,
         changePosition: false,

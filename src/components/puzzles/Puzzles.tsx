@@ -551,7 +551,7 @@ function Puzzles({ id }: { id: string }) {
             )}
           </Group>
           <Divider my="sm" />
-          {!isPuzzleIncomplete && (puzzles[currentPuzzle]?.themes?.length ?? 0) > 0 && (
+          {(puzzles[currentPuzzle]?.themes?.length ?? 0) > 0 && (
             <Group gap="xs" mb="sm">
               {puzzles[currentPuzzle]?.themes?.map((theme) => (
                 <Badge key={theme} variant="light" size="sm">
@@ -561,13 +561,20 @@ function Puzzles({ id }: { id: string }) {
             </Group>
           )}
           <Group justify="space-between">
-            <Text fz="1.75rem" fw={500}>
-              {!turnToMove
-                ? ""
-                : turnToMove === "white"
-                  ? t("Fen.BlackToMove")
-                  : t("Fen.WhiteToMove")}
-            </Text>
+            <Group gap="md">
+              <Text fz="1.75rem" fw={500}>
+                {!turnToMove
+                  ? ""
+                  : turnToMove === "white"
+                    ? t("Fen.BlackToMove")
+                    : t("Fen.WhiteToMove")}
+              </Text>
+              {turnToMove && (
+                <Badge size="lg" color={turnToMove === "white" ? "dark" : "gray"} variant="filled">
+                  You play as {turnToMove === "white" ? "Black" : "White"}
+                </Badge>
+              )}
+            </Group>
             <Group gap="xs">
               <Tooltip label={t("Puzzle.NewPuzzle")}>
                 <ActionIcon
