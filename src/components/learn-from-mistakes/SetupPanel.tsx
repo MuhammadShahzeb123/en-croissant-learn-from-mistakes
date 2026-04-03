@@ -83,28 +83,26 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
     }
   }, [activeEnginePath]);
 
-  // Build account options from sessions
-  const accountOptions: { value: string; label: string }[] = [];
+  // Build account options from sessions (deduplicated by value)
+  const accountOptionsMap = new Map<string, { value: string; label: string }>();
   for (const session of sessions || []) {
     if (session.lichess) {
-      accountOptions.push({
-        value: `lichess:${session.lichess.username}`,
-        label: `${session.lichess.username} (Lichess)`,
-      });
+      const v = `lichess:${session.lichess.username}`;
+      if (!accountOptionsMap.has(v))
+        accountOptionsMap.set(v, { value: v, label: `${session.lichess.username} (Lichess)` });
     }
     if (session.chessCom) {
-      accountOptions.push({
-        value: `chess.com:${session.chessCom.username}`,
-        label: `${session.chessCom.username} (Chess.com)`,
-      });
+      const v = `chess.com:${session.chessCom.username}`;
+      if (!accountOptionsMap.has(v))
+        accountOptionsMap.set(v, { value: v, label: `${session.chessCom.username} (Chess.com)` });
     }
     if (session.player) {
-      accountOptions.push({
-        value: `local:${session.player}`,
-        label: `${session.player} (Local)`,
-      });
+      const v = `local:${session.player}`;
+      if (!accountOptionsMap.has(v))
+        accountOptionsMap.set(v, { value: v, label: `${session.player} (Local)` });
     }
   }
+  const accountOptions = Array.from(accountOptionsMap.values());
 
   // Build UCI options from current Threads/Hash values + any other engine settings
   function buildUciOptions(): EngineOption[] {
@@ -133,7 +131,7 @@ export default function SetupPanel({ onStart }: SetupPanelProps) {
     if (!(await exists(mistakeDir))) {
       await mkdir(mistakeDir, { recursive: true });
     }
-    return resolve(mistakeDir, "mistake_puzzles.db3");
+    return resolve(mistakeDir, "mistake_puzzles.pgn");
   }
 
   async function handleStart() {

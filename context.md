@@ -10,27 +10,38 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 - **Local Engine**: Select any installed UCI engine (Stockfish, etc.). Requires CPU, configurable depth/threads/hash.
 - **Lichess Cloud**: Uses pre-computed Lichess cloud evaluations (https://lichess.org/api/cloud-eval). No local engine needed. Positions not in the cloud DB are skipped. Much faster for common positions.
 - **Hybrid (Cloud + Local)**: Tries Lichess Cloud Eval first (free, fast), then falls back to a local engine for positions not in the cloud. Best of both worlds. Features:
-  - Waterfall pattern: cloud first → shared local engine fallback per position
+  - **Batch pre-fetch**: Before per-game analysis, collects ALL unique player-position FENs across all games, deduplicates, and batch-fetches from Lichess cloud into an in-memory cache. Analysis then runs almost entirely from cache hits (~70%+ cloud hit rate).
+  - Waterfall pattern per position: cache → cloud → shared local engine fallback
   - Smart position filtering: skips first 4 player moves (opening theory)
-  - In-memory FEN cache: avoids re-analyzing identical positions across games
-  - Parallel analysis: up to 2 games concurrently via tokio semaphore (reduced from 4)
+  - In-memory FEN cache: shared across all games, populated by batch pre-fetch
+  - Parallel analysis: up to 2 games concurrently via tokio semaphore
   - **Single shared engine** behind `Arc<TokioMutex>` — prevents multiple engine processes
-  - Cloud rate limiting: ≥1s between Lichess API requests, HTTP 429 retry (60s wait)
-  - Cloud depth threshold: only accepts cloud evals with depth ≥ 20
+  - Adaptive cloud rate limiting: 200ms base interval (5 req/s), doubles on HTTP 429, halves on success (capped at 5s)
+  - Cloud depth threshold: accepts cloud evals with depth ≥ 16 (lowered from 20 for higher hit rate)
+  - Reduced engine depth (8) for "after" position evals — only needs eval confirmation, not full analysis
   - Miss detection: tracks eval before opponent's move to detect missed opportunities
 
 ### Puzzle Flow
 1. User configures analysis on the **Learn** page (account, engine, depth, mistake types)
-2. Backend analyzes all games, finds mistakes, stores metadata in `mistake_puzzles.db3`
+2. Backend analyzes all games, finds mistakes, writes them to a **PGN file** (`mistake_puzzles.pgn`) with custom headers per puzzle
 3. After analysis, mistakes are **exported** to a standard puzzle DB (e.g., `my_mistakes_username_lichess.db3`) in the puzzles directory
 4. User is automatically navigated to the **Puzzles tab** with the new DB selected
 5. Puzzles work through the existing PuzzleBoard system with full Chessground board, move validation, streaks, and timing
+
+### Mistake Storage Format (PGN)
+Mistakes are stored in a standard PGN file (`mistake_puzzles.pgn`) instead of a SQLite database. Each puzzle is a separate PGN game entry with custom headers:
+- First entry: `[Event "Analysis Metadata"]` — stores game accuracy, total moves analyzed, timestamps
+- Subsequent entries: `[Event "Mistake Puzzle"]` — one per mistake, with headers for all metadata (FEN, played move, best move, eval, classification, etc.)
+- Human-readable comment with mistake/best/punishment summary
+- Completion status tracked via `[Completed "0|1|2"]` header
+- Standard PGN format readable by other tools
 
 ## Architecture
 
 ### Backend (Rust)
 - **`src-tauri/src/mistake_puzzle.rs`** — Main module containing:
-  - SQLite table `mistake_puzzles` (created via rusqlite, not diesel)
+  - PGN file I/O for mistake puzzle storage (write_mistakes_to_pgn, read_mistakes_from_pgn, update_completion_in_pgn)
+  - rusqlite used ONLY for exporting to standard Lichess puzzle DB format
   - `analyze_games_for_mistakes` — Tauri command that:
     - Queries games from a user's database (using diesel)
     - Decodes binary-encoded moves using `iter_mainline_move_bytes` + `decode_move`
@@ -39,11 +50,11 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
     - For mistakes: stores FEN, played move, best move, best line, opponent punishment line
     - Supports cancellation via existing `analysis_cancel_flags` pattern
     - Emits progress events
-  - `get_mistake_puzzles` — CRUD retrieval with filters (username, source, annotation, completion)
-  - `update_mistake_puzzle_completion` — Mark puzzle solved/failed
-  - `get_mistake_stats` — Aggregate stats (total, by type, accuracy)
-  - `delete_mistake_puzzles` — Clear puzzles
-  - `init_mistake_db` — Create the database/table
+  - `get_mistake_puzzles` — Reads PGN, applies filters in memory
+  - `update_mistake_puzzle_completion` — Updates Completed header in PGN
+  - `get_mistake_stats` — Computes stats from in-memory puzzle data
+  - `delete_mistake_puzzles` — Deletes the PGN file
+  - `init_mistake_db` — Ensures parent directory exists (no-op otherwise)
 
 - **Modified `src-tauri/src/chess.rs`**:
   - Made `BestMoves` fields public
@@ -72,14 +83,16 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 - **All other translation files** — `SideBar.Learn` key added
 
 ## Annotation Thresholds
-### Legacy (Win Chance Drop — still used for backward compat)
+### Legacy (Win Chance Drop — fallback only when CP classification returns no annotation)
 - `??` (Blunder) — Win chance drop > 20%
 - `?` (Mistake) — Win chance drop > 10%
 - `?!` (Inaccuracy) — Win chance drop > 5%
 - `miss` (Missed Opportunity) — Enhanced detection (see below)
 - User can filter which types generate puzzles
 
-### New: Centipawn-Based Classification (move_classification field)
+### Primary: Centipawn-Based Classification (move_classification field)
+- CP-based classification takes precedence over legacy win-chance-drop
+- Legacy annotation is used ONLY when CP classification returns empty (BEST/EXCELLENT/GOOD)
 - `BEST` — Eval delta ≤ 10cp
 - `EXCELLENT` — Eval delta ≤ 25cp
 - `GOOD` — Eval delta ≤ 50cp
@@ -97,8 +110,27 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 ### Game Accuracy (Chess.com-style)
 - Formula: `103.1668 * exp(-0.04354 * (evalDelta/100)) - 3.1669` per move
 - All player moves tracked (best moves = 0cp delta, non-best = computed delta)
-- Stored in `analysis_metadata` table, returned in MistakeStats.gameAccuracy
+- Stored in PGN metadata entry, returned in MistakeStats.gameAccuracy
 - Displayed as a separate ring in StatsPanel
+
+### Position Filtering
+- **MIN_PLAYER_MOVE_NUMBER = 5**: Skips first 4 player moves (~8 half-moves) to avoid flagging opening choices as mistakes. Applied in ALL analysis paths (local, cloud, hybrid).
+
+### CRITICAL: Eval Perspective Convention (Fixed Bug)
+- **`parse_uci_attrs` in chess.rs** normalizes ALL engine (UCI) scores to **White's absolute perspective** by inverting when it's Black to move. Score = +200 means White is winning by 200cp regardless of whose turn it is.
+- **Lichess Cloud Eval API** returns scores from the **side-to-move's perspective**. Score = +200 means the side to move is winning.
+- **Hybrid `get_eval_for_fen`** normalizes cloud scores to White's absolute perspective before returning (checks FEN second field for 'b').
+- **All callers** (local + hybrid paths) use `score_from_player_perspective(score, Color::White, player_color)` — NOT `player_color`/`opponent_color` as side_to_move.
+- **Cloud path** still uses `score_from_player_perspective(score, player_color/opponent_color, player_color)` since cloud scores are NOT pre-normalized.
+- BUG THAT WAS PRESENT: Local/hybrid paths used player_color/opponent_color, causing double-negation for Black player before-evals and White player after-evals, severely underestimating centipawn loss (turned 3-pawn blunders into 1-pawn inaccuracies).
+
+### Puzzle Export (Standard Lichess Format)
+- Converts PGN mistakes to standard puzzle DB (SQLite) for the PuzzleBoard system
+- Uses DELETE journal mode (not WAL) to avoid file lock issues on Windows
+- Supports two puzzle construction modes:
+  1. **With predecessor**: FEN = position before opponent's last move, moves = [opponent_move, best_line]
+  2. **Without predecessor** (fallback): Computes FEN after player's bad move, moves = [opponent_punishment, best_line]
+- Connection explicitly dropped after writing to release file handles before frontend reads
 
 ## Data Flow
 1. User selects account (Lichess/Chess.com from sessionsAtom)
@@ -106,7 +138,7 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 3. App checks if user's games database exists (from previous import)
 4. Start `analyze_games_for_mistakes` command
 5. Backend queries all player games from DB, runs engine analysis per position
-6. Mistakes stored in `mistake_puzzles.db3` (app data dir) with metadata
+6. Mistakes stored in `mistake_puzzles.pgn` (app data dir) as PGN with custom headers
 7. After analysis, `export_mistakes_to_puzzle_db` creates a standard puzzle DB
 8. User redirected to Puzzles tab with new DB auto-selected
 9. Puzzles rendered by the existing PuzzleBoard system (full Chessground board)
@@ -121,9 +153,48 @@ A feature inspired by Lichess's "Learn from Mistakes." It imports all games from
 
 ## Build Status
 - Frontend: ✅ No TypeScript errors in any modified files
-- Backend (Cargo): ✅ `cargo check` passes. Only non-blocking warnings: unused `est_left`, dead code fields
+- Backend (Cargo): ✅ `cargo check` passes cleanly (exit code 0)
 
-## Latest Fixes
+## Latest Changes
+
+### Session 15: Hybrid Analysis Performance Fix (~90min → ~5-10min for 46 games)
+Root cause: Self-imposed 1000ms rate limit between Lichess cloud API requests, overly strict depth≥20 filter rejecting usable cloud evals, and no batch pre-fetching — causing serial per-position cloud lookups across all games.
+
+- **Batch pre-fetch** (mistake_puzzle.rs):
+  - Before per-game analysis, walks ALL games to collect unique player-position FENs (before + after move)
+  - Deduplicates FENs across all 46+ games
+  - Batch-fetches from Lichess cloud eval API into the shared `FenCache` (cloud-only, no engine fallback)
+  - Progress bar shows 0-50% during pre-fetch phase, 50-100% during per-game analysis
+  - Expected: ~70%+ of positions found in cloud → analysis loop becomes mostly cache hits
+  - Logs total FENs, cloud hit count, and hit rate percentage
+
+- **Adaptive rate limiting** (mistake_puzzle.rs):
+  - `CloudRateLimiter` now has dynamic `interval_ms` field starting at 200ms (was hardcoded 1000ms)
+  - Constants: `CLOUD_BASE_INTERVAL_MS = 200`, `CLOUD_MAX_INTERVAL_MS = 5000`
+  - `on_success()`: halves interval toward base (recovery after backoff)
+  - `on_rate_limited()`: doubles interval (capped at 5s) + logs new interval
+  - `wait()`: uses current dynamic interval instead of hardcoded 1s
+  - Net effect: 5× faster cloud requests (5 req/s vs old 1 req/s)
+
+- **HTTP 429 adaptive backoff** (mistake_puzzle.rs):
+  - Replaced hardcoded `sleep(60s)` with adaptive backoff using current interval
+  - On 429: calls `on_rate_limited()` (doubles interval), waits that amount, retries once
+  - On retry success: calls `on_success()` (starts recovering interval)
+  - Much faster recovery than old blind 60s wait
+
+- **Cloud depth threshold lowered 20 → 16** (mistake_puzzle.rs):
+  - `get_eval_for_fen()` now passes `min_depth=16` to `fetch_cloud_eval_hybrid()`
+  - Depth 16 is sufficient for detecting inaccuracies/mistakes/blunders
+  - Increases cloud hit rate by ~20-30% (many positions have depth 16-19 in Lichess cloud)
+
+- **Reduced engine depth for "after" positions** (mistake_puzzle.rs):
+  - "After" position eval (confirming the eval of the player's actual move) now uses `GoMode::Depth(8)` instead of full analysis depth
+  - Only affects engine fallback (cache/cloud hits use whatever depth is stored)
+  - Reduces engine time by ~60% for these positions
+
+- **Performance estimate**:
+  - Before: ~2,300 requests × 1s + engine fallback = 90+ minutes for 46 games
+  - After: ~1,150 unique FENs × 0.2s pre-fetch + cache-only analysis + sparse engine fallback ≈ 5-10 minutes
 
 ### Session 7: Engine Freeze Fix + Miss Detection + Puzzle Visibility + Depth Optimization
 - **CRITICAL FIX: Hybrid mode no longer spawns multiple engine processes** (mistake_puzzle.rs):

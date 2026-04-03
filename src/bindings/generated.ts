@@ -476,7 +476,7 @@ async getMistakePuzzles(dbPath: string, filter: MistakePuzzleFilter) : Promise<R
     else return { status: "error", error: e  as any };
 }
 },
-async updateMistakePuzzleCompletion(dbPath: string, puzzleId: number, completed: number) : Promise<Result<null, string>> {
+async updateMistakePuzzleCompletion(dbPath: string, puzzleId: bigint, completed: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("update_mistake_puzzle_completion", { dbPath, puzzleId, completed }) };
 } catch (e) {
@@ -544,6 +544,7 @@ progressEvent: "progress-event"
 /** user-defined types **/
 
 export type AnalysisOptions = { fen: string; moves: string[]; annotateNovelties: boolean; referenceDb: string | null; reversed: boolean }
+export type AnalyzeGamesRequest = { id: string; engine: string; engineType: string; goMode: GoMode; uciOptions: EngineOption[]; dbPath: string; mistakeDbPath: string; username: string; source: string; minWinChanceDrop: number }
 export type BestMoves = { nodes: number; depth: number; score: Score; uciMoves: string[]; sanMoves: string[]; multipv: number; nps: number }
 export type BestMovesPayload = { bestLines: BestMoves[]; engine: string; tab: string; fen: string; moves: string[]; progress: number }
 export type ClockUpdateEvent = { gameId: string; whiteTime: bigint | null; blackTime: bigint | null }
@@ -568,12 +569,10 @@ export type GameSort = "id" | "date" | "whiteElo" | "blackElo" | "ply_count"
 export type GameState = { gameId: string; status: GameStatus; initialFen: string; moves: GameMove[]; currentFen: string; ply: number; turn: string; whiteTime: bigint | null; blackTime: bigint | null; whitePlayer: string; blackPlayer: string }
 export type GameStatus = "playing" | { finished: { result: GameResult } }
 export type GoMode = { t: "PlayersTime"; c: PlayersTime } | { t: "Depth"; c: number } | { t: "Time"; c: number } | { t: "Nodes"; c: number } | { t: "Infinite" }
+export type MistakePuzzle = { id: bigint; source: string; username: string; gameId: string; fen: string; playerColor: string; playedMove: string; bestMove: string; bestLine: string; opponentPunishment: string; opponentLine: string; annotation: string; cpLoss: number; winChanceDrop: number; evalBefore: string; evalAfter: string; moveNumber: number; engineDepth: number; dateAnalyzed: string; completed: number; predecessorFen: string; predecessorMove: string; isMiss: number; missOpportunityCp: number; moveClassification: string; missType: string; evalDelta: number; mateIn: number }
+export type MistakePuzzleFilter = { username: string; source: string | null; annotation: string | null; completed: number | null; limit: number | null; offset: number | null }
+export type MistakeStats = { total: bigint; solvedCorrect: bigint; solvedWrong: bigint; unsolved: bigint; blunders: bigint; mistakes: bigint; inaccuracies: bigint; misses: bigint; accuracy: number; gameAccuracy: number }
 export type MoveAnalysis = { best: BestMoves[]; novelty: boolean; is_sacrifice: boolean }
-export type MistakePuzzle = { id: number; source: string; username: string; gameId: string; fen: string; playerColor: string; playedMove: string; bestMove: string; bestLine: string; opponentPunishment: string; opponentLine: string; annotation: string; cpLoss: number; winChanceDrop: number; evalBefore: string; evalAfter: string; moveNumber: number; engineDepth: number; dateAnalyzed: string; completed: number; isMiss: number; missOpportunityCp: number; moveClassification: string; missType: string; evalDelta: number; mateIn: number }
-export type MistakeStats = { total: number; solvedCorrect: number; solvedWrong: number; unsolved: number; blunders: number; mistakes: number; inaccuracies: number; misses: number; accuracy: number; gameAccuracy: number }
-export type MistakeAnalysisProgress = { gamesDone: number; gamesTotal: number; positionsAnalyzed: number; cloudHits: number; engineAnalyzed: number; cacheHits: number; estimatedSecondsLeft: number }
-export type MistakePuzzleFilter = { username: string; source?: string | null; annotation?: string | null; completed?: number | null; limit?: number | null; offset?: number | null }
-export type AnalyzeGamesRequest = { id: string; engine: string; engineType: string; goMode: GoMode; uciOptions: EngineOption[]; dbPath: string; mistakeDbPath: string; username: string; source: string; minWinChanceDrop: number }
 export type NormalizedGame = { id: number; fen: string; event: string; event_id: number; site: string; site_id: number; date?: string | null; time?: string | null; round?: string | null; white: string; white_id: number; white_elo?: number | null; black: string; black_id: number; black_elo?: number | null; result: Outcome; time_control?: string | null; eco?: string | null; ply_count?: number | null; moves: string }
 export type OpeningBookConfig = { path: string; maxPly?: bigint }
 export type OutOpening = { name: string; fen: string }
@@ -592,16 +591,16 @@ export type Puzzle = { id: number; fen: string; moves: string; rating: number; r
 export type PuzzleDatabaseInfo = { title: string; description: string; puzzleCount: number; storageSize: bigint; path: string }
 export type QueryOptions<SortT> = { skipCount: boolean; page?: number | null; pageSize?: number | null; sort: SortT; direction: SortDirection }
 export type QueryResponse<T> = { data: T; count: number | null }
-export type Score = { value: ScoreValue;
+export type Score = { value: ScoreValue; 
 /**
  * The probability of each result (win, draw, loss).
  */
 wdl: [number, number, number] | null }
-export type ScoreValue =
+export type ScoreValue = 
 /**
  * The score in centipawns.
  */
-{ type: "cp"; value: number } |
+{ type: "cp"; value: number } | 
 /**
  * Mate coming up in this many moves. Negative value means the engine is getting mated.
  */
@@ -617,71 +616,71 @@ export type TournamentSort = "id" | "name"
 /**
  * Represents a UCI option definition.
  */
-export type UciOptionConfig =
+export type UciOptionConfig = 
 /**
  * The option of type `check` (a boolean).
  */
-{ type: "check"; value: {
+{ type: "check"; value: { 
 /**
  * The name of the option.
  */
-name: string;
+name: string; 
 /**
  * The default value of this `bool` property.
  */
-default: boolean | null } } |
+default: boolean | null } } | 
 /**
  * The option of type `spin` (a signed integer).
  */
-{ type: "spin"; value: {
+{ type: "spin"; value: { 
 /**
  * The name of the option.
  */
-name: string;
+name: string; 
 /**
  * The default value of this integer property.
  */
-default: bigint | null;
+default: bigint | null; 
 /**
  * The minimal value of this integer property.
  */
-min: bigint | null;
+min: bigint | null; 
 /**
  * The maximal value of this integer property.
  */
-max: bigint | null } } |
+max: bigint | null } } | 
 /**
  * The option of type `combo` (a list of strings).
  */
-{ type: "combo"; value: {
+{ type: "combo"; value: { 
 /**
  * The name of the option.
  */
-name: string;
+name: string; 
 /**
  * The default value for this list of strings.
  */
-default: string | null;
+default: string | null; 
 /**
  * The list of acceptable strings.
  */
-var: string[] } } |
+var: string[] } } | 
 /**
  * The option of type `button` (an action).
  */
-{ type: "button"; value: {
+{ type: "button"; value: { 
 /**
  * The name of the option.
  */
-name: string } } |
+name: string } } | 
 /**
  * The option of type `string` (a string, unsurprisingly).
  */
-{ type: "string"; value: {
+{ type: "string"; value: { 
 /**
  * The name of the option.
  */
-name: string;
+name: string; 
 /**
  * The default value of this string option.
  */

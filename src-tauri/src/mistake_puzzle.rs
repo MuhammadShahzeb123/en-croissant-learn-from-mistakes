@@ -289,9 +289,11 @@ async fn fetch_cloud_eval_hybrid(
     Ok(Some(data))
 }
 
-/// Minimum player move index to start analyzing. move_number <= 4 means skip
-/// the first 4 player moves (~8 half-moves). Catches opening theory.
-const MIN_PLAYER_MOVE_NUMBER: i32 = 5;
+/// Minimum player move number to start analyzing (1-based).
+/// Set to 2 to skip only the very first player move (e.g. "1.d4 vs 1.e4"
+/// opening-preference false positives), but allow all subsequent moves
+/// to be analyzed including early opening mistakes.
+const MIN_PLAYER_MOVE_NUMBER: i32 = 2;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -318,6 +320,8 @@ pub struct MistakePuzzle {
     pub engine_depth: i32,
     pub date_analyzed: String,
     pub completed: i32, // 0=unsolved, 1=correct, 2=wrong
+    pub predecessor_fen: String,
+    pub predecessor_move: String,
     pub is_miss: i32,
     pub miss_opportunity_cp: i32,
     pub move_classification: String,
@@ -365,85 +369,362 @@ pub struct MistakePuzzleFilter {
     pub offset: Option<i32>,
 }
 
-// ── SQLite table management ─────────────────────────────────────────────────
+// ── PGN-based mistake puzzle storage ────────────────────────────────────────
 
-const CREATE_MISTAKE_PUZZLES_TABLE: &str = "
-CREATE TABLE IF NOT EXISTS mistake_puzzles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    username TEXT NOT NULL,
-    game_id TEXT NOT NULL,
-    fen TEXT NOT NULL,
-    player_color TEXT NOT NULL,
-    played_move TEXT NOT NULL,
-    best_move TEXT NOT NULL,
-    best_line TEXT NOT NULL DEFAULT '',
-    opponent_punishment TEXT NOT NULL DEFAULT '',
-    opponent_line TEXT NOT NULL DEFAULT '',
-    annotation TEXT NOT NULL,
-    cp_loss INTEGER NOT NULL,
-    win_chance_drop REAL NOT NULL,
-    eval_before TEXT NOT NULL,
-    eval_after TEXT NOT NULL,
-    move_number INTEGER NOT NULL,
-    engine_depth INTEGER NOT NULL,
-    date_analyzed TEXT NOT NULL,
-    completed INTEGER NOT NULL DEFAULT 0,
-    predecessor_fen TEXT NOT NULL DEFAULT '',
-    predecessor_move TEXT NOT NULL DEFAULT '',
-    is_miss INTEGER NOT NULL DEFAULT 0,
-    miss_opportunity_cp INTEGER NOT NULL DEFAULT 0,
-    move_classification TEXT NOT NULL DEFAULT '',
-    miss_type TEXT NOT NULL DEFAULT '',
-    eval_delta INTEGER NOT NULL DEFAULT 0,
-    mate_in INTEGER NOT NULL DEFAULT 0
-);
+/// Metadata stored alongside puzzles in the PGN file (first entry).
+#[derive(Debug, Clone, Default)]
+struct AnalysisMetadata {
+    username: String,
+    source: String,
+    game_accuracy: f64,
+    total_moves_analyzed: i32,
+    date_analyzed: String,
+}
 
-CREATE TABLE IF NOT EXISTS analysis_metadata (
-    username TEXT NOT NULL,
-    source TEXT NOT NULL,
-    game_accuracy REAL NOT NULL DEFAULT 0,
-    total_moves_analyzed INTEGER NOT NULL DEFAULT 0,
-    date_analyzed TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY(username, source)
-);
-";
+/// Escape a PGN header value: replace backslash and quote characters.
+fn pgn_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
 
-fn ensure_table(conn: &rusqlite::Connection) -> Result<(), Error> {
-    conn.execute_batch(CREATE_MISTAKE_PUZZLES_TABLE)?;
-    // Migration: add predecessor columns if table existed before this update
-    let _ = conn.execute_batch(
-        "ALTER TABLE mistake_puzzles ADD COLUMN predecessor_fen TEXT NOT NULL DEFAULT '';
-         ALTER TABLE mistake_puzzles ADD COLUMN predecessor_move TEXT NOT NULL DEFAULT '';",
-    );
-    // Migration: add miss columns
-    let _ = conn.execute_batch(
-        "ALTER TABLE mistake_puzzles ADD COLUMN is_miss INTEGER NOT NULL DEFAULT 0;
-         ALTER TABLE mistake_puzzles ADD COLUMN miss_opportunity_cp INTEGER NOT NULL DEFAULT 0;",
-    );
-    // Migration: add enhanced classification columns
-    let _ = conn.execute_batch(
-        "ALTER TABLE mistake_puzzles ADD COLUMN move_classification TEXT NOT NULL DEFAULT '';
-         ALTER TABLE mistake_puzzles ADD COLUMN miss_type TEXT NOT NULL DEFAULT '';
-         ALTER TABLE mistake_puzzles ADD COLUMN eval_delta INTEGER NOT NULL DEFAULT 0;
-         ALTER TABLE mistake_puzzles ADD COLUMN mate_in INTEGER NOT NULL DEFAULT 0;",
-    );
-    // Create indexes after all migrations are complete
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_mp_username ON mistake_puzzles(username);
-         CREATE INDEX IF NOT EXISTS idx_mp_source ON mistake_puzzles(source);
-         CREATE INDEX IF NOT EXISTS idx_mp_annotation ON mistake_puzzles(annotation);
-         CREATE INDEX IF NOT EXISTS idx_mp_completed ON mistake_puzzles(completed);
-         CREATE INDEX IF NOT EXISTS idx_mp_is_miss ON mistake_puzzles(is_miss);
-         CREATE UNIQUE INDEX IF NOT EXISTS idx_mp_dedup ON mistake_puzzles(username, source, game_id, fen, played_move);",
-    )?;
+/// Unescape a PGN header value.
+#[allow(dead_code)]
+fn pgn_unescape(s: &str) -> String {
+    s.replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+/// Write mistake puzzles and analysis metadata to a PGN file.
+/// Each puzzle becomes a separate PGN game entry with custom headers.
+/// The first entry is a metadata record with [Event "Analysis Metadata"].
+fn write_mistakes_to_pgn(
+    path: &str,
+    items: &[PendingMistakePuzzle],
+    metadata: &AnalysisMetadata,
+) -> Result<(), Error> {
+    use std::fmt::Write as FmtWrite;
+    let mut pgn = String::new();
+
+    // Metadata entry
+    writeln!(pgn, "[Event \"Analysis Metadata\"]").unwrap();
+    writeln!(pgn, "[Username \"{}\"]", pgn_escape(&metadata.username)).unwrap();
+    writeln!(pgn, "[Source \"{}\"]", pgn_escape(&metadata.source)).unwrap();
+    writeln!(pgn, "[GameAccuracy \"{:.2}\"]", metadata.game_accuracy).unwrap();
+    writeln!(pgn, "[TotalMovesAnalyzed \"{}\"]", metadata.total_moves_analyzed).unwrap();
+    writeln!(pgn, "[DateAnalyzed \"{}\"]", pgn_escape(&metadata.date_analyzed)).unwrap();
+    writeln!(pgn, "\n*\n").unwrap();
+
+    // Puzzle entries
+    for (idx, item) in items.iter().enumerate() {
+        let puzzle_id = idx as i64 + 1;
+        writeln!(pgn, "[Event \"Mistake Puzzle\"]").unwrap();
+        writeln!(pgn, "[PuzzleId \"{}\"]", puzzle_id).unwrap();
+        writeln!(pgn, "[SetUp \"1\"]").unwrap();
+        writeln!(pgn, "[FEN \"{}\"]", pgn_escape(&item.fen)).unwrap();
+        writeln!(pgn, "[Source \"{}\"]", pgn_escape(&item.source)).unwrap();
+        writeln!(pgn, "[Username \"{}\"]", pgn_escape(&item.username)).unwrap();
+        writeln!(pgn, "[GameId \"{}\"]", pgn_escape(&item.game_id)).unwrap();
+        writeln!(pgn, "[PlayerColor \"{}\"]", pgn_escape(&item.player_color)).unwrap();
+        writeln!(pgn, "[PlayedMove \"{}\"]", pgn_escape(&item.played_move)).unwrap();
+        writeln!(pgn, "[BestMove \"{}\"]", pgn_escape(&item.best_move)).unwrap();
+        writeln!(pgn, "[BestLine \"{}\"]", pgn_escape(&item.best_line)).unwrap();
+        writeln!(pgn, "[OpponentPunishment \"{}\"]", pgn_escape(&item.opponent_punishment)).unwrap();
+        writeln!(pgn, "[OpponentLine \"{}\"]", pgn_escape(&item.opponent_line)).unwrap();
+        writeln!(pgn, "[Annotation \"{}\"]", pgn_escape(&item.annotation)).unwrap();
+        writeln!(pgn, "[CpLoss \"{}\"]", item.cp_loss).unwrap();
+        writeln!(pgn, "[WinChanceDrop \"{:.2}\"]", item.win_chance_drop).unwrap();
+        writeln!(pgn, "[EvalBefore \"{}\"]", pgn_escape(&item.eval_before)).unwrap();
+        writeln!(pgn, "[EvalAfter \"{}\"]", pgn_escape(&item.eval_after)).unwrap();
+        writeln!(pgn, "[MoveNumber \"{}\"]", item.move_number).unwrap();
+        writeln!(pgn, "[EngineDepth \"{}\"]", item.engine_depth).unwrap();
+        writeln!(pgn, "[DateAnalyzed \"{}\"]", pgn_escape(&item.date_analyzed)).unwrap();
+        writeln!(pgn, "[Completed \"0\"]").unwrap();
+        writeln!(pgn, "[PredecessorFen \"{}\"]", pgn_escape(&item.predecessor_fen)).unwrap();
+        writeln!(pgn, "[PredecessorMove \"{}\"]", pgn_escape(&item.predecessor_move)).unwrap();
+        writeln!(pgn, "[IsMiss \"{}\"]", if item.is_miss { 1 } else { 0 }).unwrap();
+        writeln!(pgn, "[MissType \"{}\"]", pgn_escape(&item.miss_type)).unwrap();
+        writeln!(pgn, "[MissOpportunityCp \"{}\"]", item.miss_opportunity_cp).unwrap();
+        writeln!(pgn, "[MoveClassification \"{}\"]", pgn_escape(&item.move_classification)).unwrap();
+        writeln!(pgn, "[EvalDelta \"{}\"]", item.eval_delta).unwrap();
+        writeln!(pgn, "[MateIn \"{}\"]", item.mate_in).unwrap();
+        writeln!(pgn, "[Result \"*\"]").unwrap();
+        // Comment with human-readable summary
+        writeln!(
+            pgn,
+            "\n{{ Mistake: {}. Best: {}. Punishment: {} }}\n*\n",
+            item.played_move, item.best_move, item.opponent_punishment
+        ).unwrap();
+    }
+
+    std::fs::write(path, pgn)?;
+    info!("Wrote {} mistake puzzles to PGN: {}", items.len(), path);
     Ok(())
 }
 
-fn open_db(path: &str) -> Result<rusqlite::Connection, Error> {
+/// Parse PGN header line like `[Key "Value"]` → Some((key, value))
+fn parse_pgn_header(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if !line.starts_with('[') || !line.ends_with(']') {
+        return None;
+    }
+    let inner = &line[1..line.len() - 1];
+    let quote_start = inner.find('"')?;
+    let key = inner[..quote_start].trim().to_string();
+    let rest = &inner[quote_start + 1..];
+    // Find the closing quote (handle escaped quotes)
+    let mut value = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                value.push(next);
+            }
+        } else if c == '"' {
+            break;
+        } else {
+            value.push(c);
+        }
+    }
+    Some((key, value))
+}
+
+/// Read all mistake puzzles and metadata from a PGN file.
+/// Returns (puzzles, metadata).
+fn read_mistakes_from_pgn(path: &str) -> Result<(Vec<MistakePuzzle>, AnalysisMetadata), Error> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), AnalysisMetadata::default()));
+        }
+        Err(e) => return Err(Error::Io(Box::new(e))),
+    };
+
+    let mut puzzles: Vec<MistakePuzzle> = Vec::new();
+    let mut metadata = AnalysisMetadata::default();
+
+    // Split by blank lines followed by * to separate game entries
+    // PGN entries are separated by the result marker "*" followed by blank lines
+    let mut current_headers: HashMap<String, String> = HashMap::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if let Some((key, val)) = parse_pgn_header(trimmed) {
+            current_headers.insert(key, val);
+            continue;
+        }
+
+        // A line with just "*" or starting with "{" (comment) signals end of an entry
+        if trimmed == "*" || trimmed.starts_with("{ ") || (trimmed.ends_with("*") && trimmed.contains('}')) {
+            if !current_headers.is_empty() {
+                let event = current_headers.get("Event").cloned().unwrap_or_default();
+
+                if event == "Analysis Metadata" {
+                    metadata.username = current_headers.get("Username").cloned().unwrap_or_default();
+                    metadata.source = current_headers.get("Source").cloned().unwrap_or_default();
+                    metadata.game_accuracy = current_headers
+                        .get("GameAccuracy")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0.0);
+                    metadata.total_moves_analyzed = current_headers
+                        .get("TotalMovesAnalyzed")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    metadata.date_analyzed = current_headers
+                        .get("DateAnalyzed")
+                        .cloned()
+                        .unwrap_or_default();
+                } else if event == "Mistake Puzzle" {
+                    let get = |key: &str| -> String {
+                        current_headers.get(key).cloned().unwrap_or_default()
+                    };
+                    let get_i32 = |key: &str| -> i32 {
+                        current_headers
+                            .get(key)
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0)
+                    };
+                    let get_i64 = |key: &str| -> i64 {
+                        current_headers
+                            .get(key)
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0)
+                    };
+                    let get_f64 = |key: &str| -> f64 {
+                        current_headers
+                            .get(key)
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0.0)
+                    };
+
+                    puzzles.push(MistakePuzzle {
+                        id: get_i64("PuzzleId"),
+                        source: get("Source"),
+                        username: get("Username"),
+                        game_id: get("GameId"),
+                        fen: get("FEN"),
+                        player_color: get("PlayerColor"),
+                        played_move: get("PlayedMove"),
+                        best_move: get("BestMove"),
+                        best_line: get("BestLine"),
+                        opponent_punishment: get("OpponentPunishment"),
+                        opponent_line: get("OpponentLine"),
+                        annotation: get("Annotation"),
+                        cp_loss: get_i32("CpLoss"),
+                        win_chance_drop: get_f64("WinChanceDrop"),
+                        eval_before: get("EvalBefore"),
+                        eval_after: get("EvalAfter"),
+                        move_number: get_i32("MoveNumber"),
+                        engine_depth: get_i32("EngineDepth"),
+                        date_analyzed: get("DateAnalyzed"),
+                        completed: get_i32("Completed"),
+                        predecessor_fen: get("PredecessorFen"),
+                        predecessor_move: get("PredecessorMove"),
+                        is_miss: get_i32("IsMiss"),
+                        miss_opportunity_cp: get_i32("MissOpportunityCp"),
+                        move_classification: get("MoveClassification"),
+                        miss_type: get("MissType"),
+                        eval_delta: get_i32("EvalDelta"),
+                        mate_in: get_i32("MateIn"),
+                    });
+                }
+
+                current_headers.clear();
+            }
+        }
+    }
+
+    // Handle last entry if file doesn't end with *
+    if !current_headers.is_empty() {
+        let event = current_headers.get("Event").cloned().unwrap_or_default();
+        if event == "Mistake Puzzle" {
+            let get = |key: &str| -> String {
+                current_headers.get(key).cloned().unwrap_or_default()
+            };
+            let get_i32 = |key: &str| -> i32 {
+                current_headers
+                    .get(key)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+            let get_i64 = |key: &str| -> i64 {
+                current_headers
+                    .get(key)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            };
+            let get_f64 = |key: &str| -> f64 {
+                current_headers
+                    .get(key)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0)
+            };
+
+            puzzles.push(MistakePuzzle {
+                id: get_i64("PuzzleId"),
+                source: get("Source"),
+                username: get("Username"),
+                game_id: get("GameId"),
+                fen: get("FEN"),
+                player_color: get("PlayerColor"),
+                played_move: get("PlayedMove"),
+                best_move: get("BestMove"),
+                best_line: get("BestLine"),
+                opponent_punishment: get("OpponentPunishment"),
+                opponent_line: get("OpponentLine"),
+                annotation: get("Annotation"),
+                cp_loss: get_i32("CpLoss"),
+                win_chance_drop: get_f64("WinChanceDrop"),
+                eval_before: get("EvalBefore"),
+                eval_after: get("EvalAfter"),
+                move_number: get_i32("MoveNumber"),
+                engine_depth: get_i32("EngineDepth"),
+                date_analyzed: get("DateAnalyzed"),
+                completed: get_i32("Completed"),
+                predecessor_fen: get("PredecessorFen"),
+                predecessor_move: get("PredecessorMove"),
+                is_miss: get_i32("IsMiss"),
+                miss_opportunity_cp: get_i32("MissOpportunityCp"),
+                move_classification: get("MoveClassification"),
+                miss_type: get("MissType"),
+                eval_delta: get_i32("EvalDelta"),
+                mate_in: get_i32("MateIn"),
+            });
+        }
+    }
+
+    Ok((puzzles, metadata))
+}
+
+/// Rewrite the PGN file, updating the Completed status of a single puzzle.
+fn update_completion_in_pgn(path: &str, puzzle_id: i64, completed: i32) -> Result<(), Error> {
+    let content = std::fs::read_to_string(path)?;
+    let mut result = String::with_capacity(content.len());
+    let mut current_puzzle_id: Option<i64> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if let Some((key, val)) = parse_pgn_header(trimmed) {
+            if key == "PuzzleId" {
+                current_puzzle_id = val.parse().ok();
+            }
+            if key == "Completed" && current_puzzle_id == Some(puzzle_id) {
+                result.push_str(&format!("[Completed \"{}\"]\n", completed));
+                continue;
+            }
+        }
+
+        // Reset on new entry
+        if trimmed == "*" || (trimmed.ends_with("*") && trimmed.contains('}')) {
+            current_puzzle_id = None;
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    std::fs::write(path, result)?;
+    Ok(())
+}
+
+/// Compute stats from a list of puzzles and metadata.
+fn compute_stats_from_puzzles(
+    puzzles: &[MistakePuzzle],
+    game_accuracy: f64,
+) -> MistakeStats {
+    let total = puzzles.len() as i64;
+    let solved_correct = puzzles.iter().filter(|p| p.completed == 1).count() as i64;
+    let solved_wrong = puzzles.iter().filter(|p| p.completed == 2).count() as i64;
+    let unsolved = puzzles.iter().filter(|p| p.completed == 0).count() as i64;
+    let blunders = puzzles.iter().filter(|p| p.annotation == "??").count() as i64;
+    let mistakes = puzzles.iter().filter(|p| p.annotation == "?").count() as i64;
+    let inaccuracies = puzzles.iter().filter(|p| p.annotation == "?!").count() as i64;
+    let misses = puzzles.iter().filter(|p| p.is_miss == 1).count() as i64;
+    let accuracy = if solved_correct + solved_wrong > 0 {
+        (solved_correct as f64 / (solved_correct + solved_wrong) as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    MistakeStats {
+        total,
+        solved_correct,
+        solved_wrong,
+        unsolved,
+        blunders,
+        mistakes,
+        inaccuracies,
+        misses,
+        accuracy,
+        game_accuracy,
+    }
+}
+
+/// Open a puzzle DB (for export to standard format). Uses rusqlite.
+/// Uses DELETE journal mode to avoid WAL/SHM lock files that can cause
+/// "database is locked" errors on Windows when the frontend reads the DB.
+fn open_puzzle_db(path: &str) -> Result<rusqlite::Connection, Error> {
     let conn = rusqlite::Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-    ensure_table(&conn)?;
+    conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")?;
     Ok(conn)
 }
 
@@ -752,7 +1033,7 @@ pub async fn analyze_games_for_mistakes(
                     let turn_before = chess.turn();
 
                     if let Some(m) = decode_move(move_byte, &chess) {
-                        let uci = UciMove::from_move(&m, castling_mode).to_string();
+                        let _uci = UciMove::from_move(&m, castling_mode).to_string();
 
                         if turn_before == player_color {
                             player_move_idx += 1;
@@ -1033,21 +1314,11 @@ pub async fn analyze_games_for_mistakes(
         update_progress(&state.progress_state, &app, id, 100.0, true)?;
     }
 
-    let mistake_conn = open_db(&mistake_db_path)?;
-
-    // Clear old puzzles for this user+source before inserting fresh results
-    mistake_conn.execute(
-        "DELETE FROM mistake_puzzles WHERE username = ?1 AND source = ?2",
-        rusqlite::params![&username, &source],
-    )?;
+    // Write mistakes to PGN file
     info!(
-        "Cleared old mistake puzzles for {} / {}. Inserting {} new mistakes.",
-        username,
-        source,
-        pending_mistakes.len()
+        "Writing {} mistake puzzles for {} / {} to PGN: {}",
+        pending_mistakes.len(), username, source, mistake_db_path
     );
-
-    insert_pending_mistakes(&mistake_conn, &pending_mistakes)?;
 
     // Log annotation distribution for debugging classification issues
     {
@@ -1087,16 +1358,54 @@ pub async fn analyze_games_for_mistakes(
         all_eval_deltas.len()
     );
 
-    // Store game accuracy in analysis_metadata table
+    // Store game accuracy and puzzles in PGN file
     let now = chrono::Utc::now().to_rfc3339();
-    mistake_conn.execute(
-        "INSERT OR REPLACE INTO analysis_metadata (username, source, game_accuracy, total_moves_analyzed, date_analyzed)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![&username, &source, game_accuracy, all_eval_deltas.len() as i32, &now],
-    )?;
+    let metadata = AnalysisMetadata {
+        username: username.clone(),
+        source: source.clone(),
+        game_accuracy,
+        total_moves_analyzed: all_eval_deltas.len() as i32,
+        date_analyzed: now,
+    };
 
-    // Return stats
-    get_stats_from_db(&mistake_conn, &username, &source)
+    write_mistakes_to_pgn(&mistake_db_path, &pending_mistakes, &metadata)?;
+
+    // Build and return stats from in-memory data
+    let puzzles_for_stats: Vec<MistakePuzzle> = pending_mistakes
+        .iter()
+        .enumerate()
+        .map(|(idx, p)| MistakePuzzle {
+            id: idx as i64 + 1,
+            source: p.source.clone(),
+            username: p.username.clone(),
+            game_id: p.game_id.clone(),
+            fen: p.fen.clone(),
+            player_color: p.player_color.clone(),
+            played_move: p.played_move.clone(),
+            best_move: p.best_move.clone(),
+            best_line: p.best_line.clone(),
+            opponent_punishment: p.opponent_punishment.clone(),
+            opponent_line: p.opponent_line.clone(),
+            annotation: p.annotation.clone(),
+            cp_loss: p.cp_loss,
+            win_chance_drop: p.win_chance_drop,
+            eval_before: p.eval_before.clone(),
+            eval_after: p.eval_after.clone(),
+            move_number: p.move_number,
+            engine_depth: p.engine_depth,
+            date_analyzed: p.date_analyzed.clone(),
+            completed: 0,
+            predecessor_fen: p.predecessor_fen.clone(),
+            predecessor_move: p.predecessor_move.clone(),
+            is_miss: if p.is_miss { 1 } else { 0 },
+            miss_opportunity_cp: p.miss_opportunity_cp,
+            move_classification: p.move_classification.clone(),
+            miss_type: p.miss_type.clone(),
+            eval_delta: p.eval_delta,
+            mate_in: p.mate_in,
+        })
+        .collect();
+    Ok(compute_stats_from_puzzles(&puzzles_for_stats, game_accuracy))
 }
 
 // ── Game data from the en-croissant DB ──────────────────────────────────────
@@ -1144,54 +1453,6 @@ struct PendingMistakePuzzle {
     miss_type: String,
     eval_delta: i32,
     mate_in: i32,
-}
-
-fn insert_pending_mistakes(
-    conn: &rusqlite::Connection,
-    items: &[PendingMistakePuzzle],
-) -> Result<(), Error> {
-    for item in items {
-        conn.execute(
-            "INSERT OR IGNORE INTO mistake_puzzles (
-                source, username, game_id, fen, player_color, played_move,
-                best_move, best_line, opponent_punishment, opponent_line,
-                annotation, cp_loss, win_chance_drop, eval_before, eval_after,
-                move_number, engine_depth, date_analyzed, completed,
-                predecessor_fen, predecessor_move, is_miss, miss_opportunity_cp,
-                move_classification, miss_type, eval_delta, mate_in
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
-            rusqlite::params![
-                &item.source,
-                &item.username,
-                &item.game_id,
-                &item.fen,
-                &item.player_color,
-                &item.played_move,
-                &item.best_move,
-                &item.best_line,
-                &item.opponent_punishment,
-                &item.opponent_line,
-                &item.annotation,
-                item.cp_loss,
-                item.win_chance_drop,
-                &item.eval_before,
-                &item.eval_after,
-                item.move_number,
-                item.engine_depth,
-                &item.date_analyzed,
-                &item.predecessor_fen,
-                &item.predecessor_move,
-                item.is_miss as i32,
-                item.miss_opportunity_cp,
-                &item.move_classification,
-                &item.miss_type,
-                item.eval_delta,
-                item.mate_in,
-            ],
-        )?;
-    }
-
-    Ok(())
 }
 
 fn find_player_games(
@@ -1406,6 +1667,11 @@ async fn analyze_single_game(
     {
         let move_number = (pos_idx as i32) + 1;
 
+        // Skip the very first player move (opening choice, e.g. 1.e4 vs 1.d4)
+        if move_number < MIN_PLAYER_MOVE_NUMBER {
+            continue;
+        }
+
         // Emit position-level progress within this game
         if total_positions > 0 {
             on_position_progress(pos_idx as f32 / total_positions as f32);
@@ -1479,10 +1745,11 @@ async fn analyze_single_game(
             .unwrap_or_default();
 
         // Score of the position when playing the engine's best move
-        // Before move: side-to-move = player_color
+        // NOTE: parse_uci_attrs normalizes all engine scores to White's absolute perspective
+        // (inverts when Black to move), so we always use Color::White as side_to_move here.
         let eval_before_score = &best_lines[0].score;
         let eval_before_cp =
-            score_from_player_perspective(eval_before_score, player_color, player_color);
+            score_from_player_perspective(eval_before_score, Color::White, player_color);
         let best_mate_in = extract_mate_in(eval_before_score);
 
         // Did the player play the engine's best move?
@@ -1553,15 +1820,10 @@ async fn analyze_single_game(
             continue;
         }
 
-        // Eval after the player's move: side-to-move = opponent
+        // Eval after the player's move: parse_uci_attrs normalizes to White's absolute perspective.
         let eval_after_score = &after_lines[0].score;
-        let opponent_color = if player_color == Color::White {
-            Color::Black
-        } else {
-            Color::White
-        };
         let eval_after_cp =
-            score_from_player_perspective(eval_after_score, opponent_color, player_color);
+            score_from_player_perspective(eval_after_score, Color::White, player_color);
         let after_mate_in = extract_mate_in(eval_after_score);
 
         // Compute eval delta (centipawns lost by the player's move)
@@ -1587,26 +1849,26 @@ async fn analyze_single_game(
 
         // CP-based move classification
         let was_mate_available = best_mate_in.map_or(false, |m| m > 0);
-        let is_mate_allowed_after = after_mate_in.map_or(false, |m| m < 0);
+        let is_mate_allowed_after = after_mate_in.map_or(false, |m| m > 0);
         let move_classification = classify_move_by_cp(eval_delta_f, was_mate_available, is_mate_allowed_after);
         let mate_in_val = best_mate_in.unwrap_or(0);
 
         // Legacy annotation (win-chance-drop based)
         let annotation = classify_annotation(win_chance_drop);
 
-        // Determine final annotation: use CP-based classification if it gives a result,
-        // otherwise fall back to win-chance annotation
-        let final_annotation = if is_miss && annotation.is_empty() {
+        // Determine final annotation: CP-based classification is primary,
+        // legacy win-chance-drop annotation is fallback only when CP says move is fine.
+        let cp_annotation = classification_to_annotation(move_classification);
+        let final_annotation = if is_miss {
             "miss".to_string()
-        } else if !annotation.is_empty() {
-            annotation.to_string()
-        } else {
-            let cp_annotation = classification_to_annotation(move_classification);
-            if cp_annotation.is_empty() {
-                continue; // Neither system flagged this as notable
-            }
+        } else if !cp_annotation.is_empty() {
             cp_annotation.to_string()
+        } else {
+            annotation.to_string()
         };
+        if final_annotation.is_empty() {
+            continue; // Neither system flagged this as notable
+        }
 
         // Log every non-trivial eval drop for debugging classification issues
         if win_chance_drop > 2.0 || is_miss {
@@ -1770,6 +2032,11 @@ async fn analyze_single_game_cloud(
     for (pos_idx, (fen_str, played_uci, pred_fen, pred_move)) in positions.iter().enumerate() {
         let move_number = (pos_idx as i32) + 1;
 
+        // Skip the first player move (opening choice preference, not a real mistake)
+        if move_number < MIN_PLAYER_MOVE_NUMBER {
+            continue;
+        }
+
         if total_positions > 0 {
             on_position_progress(pos_idx as f32 / total_positions as f32);
         }
@@ -1859,25 +2126,26 @@ async fn analyze_single_game_cloud(
 
         // CP-based move classification
         let was_mate_available = best_mate_in.map_or(false, |m| m > 0);
-        let is_mate_allowed_after = after_mate_in.map_or(false, |m| m < 0);
+        let is_mate_allowed_after = after_mate_in.map_or(false, |m| m > 0);
         let move_classification = classify_move_by_cp(eval_delta_f, was_mate_available, is_mate_allowed_after);
         let mate_in_val = best_mate_in.unwrap_or(0);
 
         // Legacy annotation
         let annotation = classify_annotation(win_chance_drop);
 
-        // Determine final annotation
-        let final_annotation = if is_miss && annotation.is_empty() {
+        // Determine final annotation: CP-based classification is primary,
+        // legacy win-chance-drop annotation is fallback only when CP says move is fine.
+        let cp_annotation = classification_to_annotation(move_classification);
+        let final_annotation = if is_miss {
             "miss".to_string()
-        } else if !annotation.is_empty() {
-            annotation.to_string()
-        } else {
-            let cp_annotation = classification_to_annotation(move_classification);
-            if cp_annotation.is_empty() {
-                continue;
-            }
+        } else if !cp_annotation.is_empty() {
             cp_annotation.to_string()
+        } else {
+            annotation.to_string()
         };
+        if final_annotation.is_empty() {
+            continue;
+        }
 
         // Log every non-trivial eval drop for debugging
         if win_chance_drop > 2.0 || is_miss {
@@ -1976,7 +2244,7 @@ async fn analyze_single_game_hybrid(
     } else {
         Color::Black
     };
-    let opponent_color = if player_is_white {
+    let _opponent_color = if player_is_white {
         Color::Black
     } else {
         Color::White
@@ -2049,7 +2317,7 @@ async fn analyze_single_game_hybrid(
 
         let move_number = (pos_idx as i32) + 1;
 
-        // Skip opening moves
+        // Skip the first player move (opening choice preference, not a real mistake)
         if move_number < MIN_PLAYER_MOVE_NUMBER {
             continue;
         }
@@ -2092,7 +2360,29 @@ async fn analyze_single_game_hybrid(
             if let Some(ref cloud_data) = cloud_result {
                 if !cloud_data.pvs.is_empty() {
                     counters.cloud_hits.fetch_add(1, Ordering::SeqCst);
-                    let score = cloud_pv_to_score(&cloud_data.pvs[0]);
+                    let raw_score = cloud_pv_to_score(&cloud_data.pvs[0]);
+
+                    // Lichess Cloud Eval reports cp from the side-to-move's perspective.
+                    // Normalize to White's absolute perspective (same as parse_uci_attrs
+                    // does for UCI engine output) so callers can uniformly use
+                    // score_from_player_perspective(…, Color::White, player_color).
+                    let is_black_to_move =
+                        fen_str.split_whitespace().nth(1) == Some("b");
+                    let score = if is_black_to_move {
+                        use vampirc_uci::uci::ScoreValue;
+                        vampirc_uci::uci::Score {
+                            value: match raw_score.value {
+                                ScoreValue::Cp(cp) => ScoreValue::Cp(-cp),
+                                ScoreValue::Mate(m) => ScoreValue::Mate(-m),
+                            },
+                            lower_bound: raw_score.lower_bound,
+                            upper_bound: raw_score.upper_bound,
+                            wdl: raw_score.wdl,
+                        }
+                    } else {
+                        raw_score
+                    };
+
                     let best_uci = cloud_data.pvs[0]
                         .moves
                         .split_whitespace()
@@ -2254,7 +2544,9 @@ async fn analyze_single_game_hybrid(
             };
 
         let eval_before_cp =
-            score_from_player_perspective(&eval_before_score, player_color, player_color);
+            // get_eval_for_fen normalizes all scores (cloud & engine) to White's
+            // absolute perspective — always use Color::White as side_to_move.
+            score_from_player_perspective(&eval_before_score, Color::White, player_color);
         let best_mate_in = extract_mate_in(&eval_before_score);
 
         // Did the player play the engine's best move?
@@ -2296,7 +2588,8 @@ async fn analyze_single_game_hybrid(
             };
 
         let eval_after_cp =
-            score_from_player_perspective(&eval_after_score, opponent_color, player_color);
+            // get_eval_for_fen normalizes to White's absolute perspective.
+            score_from_player_perspective(&eval_after_score, Color::White, player_color);
         let after_mate_in = extract_mate_in(&eval_after_score);
 
         // Compute eval delta (centipawns lost by the player's move)
@@ -2357,7 +2650,7 @@ async fn analyze_single_game_hybrid(
 
         // CP-based move classification
         let was_mate_available = best_mate_in.map_or(false, |m| m > 0);
-        let is_mate_allowed_after = after_mate_in.map_or(false, |m| m < 0);
+        let is_mate_allowed_after = after_mate_in.map_or(false, |m| m > 0);
         let move_classification = classify_move_by_cp(eval_delta_f, was_mate_available, is_mate_allowed_after);
         let mate_in_val = best_mate_in.unwrap_or(0);
 
@@ -2388,15 +2681,15 @@ async fn analyze_single_game_hybrid(
             continue;
         }
 
-        // Determine final annotation
-        let final_annotation = if is_miss && annotation.is_empty() && !is_cp_notable {
+        // Determine final annotation: CP-based classification is primary,
+        // legacy win-chance-drop annotation is fallback only when CP says move is fine.
+        let cp_annotation = classification_to_annotation(move_classification);
+        let final_annotation = if is_miss {
             "miss".to_string()
-        } else if !annotation.is_empty() {
-            annotation.to_string()
-        } else if is_miss {
-            "miss".to_string()
+        } else if !cp_annotation.is_empty() {
+            cp_annotation.to_string()
         } else {
-            classification_to_annotation(move_classification).to_string()
+            annotation.to_string()
         };
 
         let engine_depth = before_depth as i32;
@@ -2455,7 +2748,7 @@ fn compute_fen_after(fen_str: &str, uci_move: &str) -> Result<String, Error> {
     Ok(Fen::from_position(pos, EnPassantMode::Legal).to_string())
 }
 
-// ── CRUD commands ───────────────────────────────────────────────────────────
+// ── CRUD commands (PGN-based) ───────────────────────────────────────────────
 
 #[tauri::command]
 #[specta::specta]
@@ -2463,85 +2756,38 @@ pub fn get_mistake_puzzles(
     db_path: String,
     filter: MistakePuzzleFilter,
 ) -> Result<Vec<MistakePuzzle>, Error> {
-    let conn = open_db(&db_path)?;
+    let (puzzles, _metadata) = read_mistakes_from_pgn(&db_path)?;
 
-    let mut sql = String::from(
-        "SELECT id, source, username, game_id, fen, player_color, played_move,
-                best_move, best_line, opponent_punishment, opponent_line,
-                annotation, cp_loss, win_chance_drop, eval_before, eval_after,
-                move_number, engine_depth, date_analyzed, completed,
-                is_miss, miss_opportunity_cp,
-                move_classification, miss_type, eval_delta, mate_in
-         FROM mistake_puzzles WHERE username = ?1",
-    );
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(filter.username.clone())];
-    let mut param_idx = 2;
-
-    if let Some(ref src) = filter.source {
-        sql.push_str(&format!(" AND source = ?{}", param_idx));
-        params.push(Box::new(src.clone()));
-        param_idx += 1;
-    }
-    if let Some(ref ann) = filter.annotation {
-        sql.push_str(&format!(" AND annotation = ?{}", param_idx));
-        params.push(Box::new(ann.clone()));
-        param_idx += 1;
-    }
-    if let Some(comp) = filter.completed {
-        sql.push_str(&format!(" AND completed = ?{}", param_idx));
-        params.push(Box::new(comp));
-        param_idx += 1;
-    }
-
-    sql.push_str(" ORDER BY id ASC");
-
-    if let Some(limit) = filter.limit {
-        sql.push_str(&format!(" LIMIT ?{}", param_idx));
-        params.push(Box::new(limit));
-        param_idx += 1;
-    }
-    if let Some(offset) = filter.offset {
-        sql.push_str(&format!(" OFFSET ?{}", param_idx));
-        params.push(Box::new(offset));
-    }
-
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let puzzles = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(MistakePuzzle {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                username: row.get(2)?,
-                game_id: row.get(3)?,
-                fen: row.get(4)?,
-                player_color: row.get(5)?,
-                played_move: row.get(6)?,
-                best_move: row.get(7)?,
-                best_line: row.get(8)?,
-                opponent_punishment: row.get(9)?,
-                opponent_line: row.get(10)?,
-                annotation: row.get(11)?,
-                cp_loss: row.get(12)?,
-                win_chance_drop: row.get(13)?,
-                eval_before: row.get(14)?,
-                eval_after: row.get(15)?,
-                move_number: row.get(16)?,
-                engine_depth: row.get(17)?,
-                date_analyzed: row.get(18)?,
-                completed: row.get(19)?,
-                is_miss: row.get(20)?,
-                miss_opportunity_cp: row.get(21)?,
-                move_classification: row.get(22)?,
-                miss_type: row.get(23)?,
-                eval_delta: row.get(24)?,
-                mate_in: row.get(25)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
+    let mut filtered: Vec<MistakePuzzle> = puzzles
+        .into_iter()
+        .filter(|p| p.username == filter.username)
+        .filter(|p| {
+            filter.source.as_ref().map_or(true, |s| &p.source == s)
+        })
+        .filter(|p| {
+            filter.annotation.as_ref().map_or(true, |a| &p.annotation == a)
+        })
+        .filter(|p| {
+            filter.completed.map_or(true, |c| p.completed == c)
+        })
         .collect();
 
-    Ok(puzzles)
+    // Apply offset
+    if let Some(offset) = filter.offset {
+        let offset = offset.max(0) as usize;
+        if offset < filtered.len() {
+            filtered = filtered[offset..].to_vec();
+        } else {
+            filtered.clear();
+        }
+    }
+
+    // Apply limit
+    if let Some(limit) = filter.limit {
+        filtered.truncate(limit.max(0) as usize);
+    }
+
+    Ok(filtered)
 }
 
 #[tauri::command]
@@ -2551,12 +2797,7 @@ pub fn update_mistake_puzzle_completion(
     puzzle_id: i64,
     completed: i32,
 ) -> Result<(), Error> {
-    let conn = open_db(&db_path)?;
-    conn.execute(
-        "UPDATE mistake_puzzles SET completed = ?1 WHERE id = ?2",
-        rusqlite::params![completed, puzzle_id],
-    )?;
-    Ok(())
+    update_completion_in_pgn(&db_path, puzzle_id, completed)
 }
 
 #[tauri::command]
@@ -2566,90 +2807,28 @@ pub fn get_mistake_stats(
     username: String,
     source: Option<String>,
 ) -> Result<MistakeStats, Error> {
-    let conn = open_db(&db_path)?;
-    get_stats_from_db(&conn, &username, source.as_deref().unwrap_or(""))
-}
+    let (puzzles, metadata) = read_mistakes_from_pgn(&db_path)?;
 
-fn get_stats_from_db(
-    conn: &rusqlite::Connection,
-    username: &str,
-    source: &str,
-) -> Result<MistakeStats, Error> {
-    let base_where = if source.is_empty() {
-        "WHERE username = ?1"
-    } else {
-        "WHERE username = ?1 AND source = ?2"
-    };
+    let filtered: Vec<&MistakePuzzle> = puzzles
+        .iter()
+        .filter(|p| p.username == username)
+        .filter(|p| {
+            source.as_ref().map_or(true, |s| &p.source == s)
+        })
+        .collect();
 
-    let count_sql = format!("SELECT COUNT(*) FROM mistake_puzzles {}", base_where);
-    let correct_sql = format!(
-        "SELECT COUNT(*) FROM mistake_puzzles {} AND completed = 1",
-        base_where
-    );
-    let wrong_sql = format!(
-        "SELECT COUNT(*) FROM mistake_puzzles {} AND completed = 2",
-        base_where
-    );
-    let unsolved_sql = format!(
-        "SELECT COUNT(*) FROM mistake_puzzles {} AND completed = 0",
-        base_where
-    );
-    let blunders_sql = format!(
-        "SELECT COUNT(*) FROM mistake_puzzles {} AND annotation = '??'",
-        base_where
-    );
-    let mistakes_sql = format!(
-        "SELECT COUNT(*) FROM mistake_puzzles {} AND annotation = '?'",
-        base_where
-    );
-    let inaccuracies_sql = format!(
-        "SELECT COUNT(*) FROM mistake_puzzles {} AND annotation = '?!'",
-        base_where
-    );
-    let misses_sql = format!(
-        "SELECT COUNT(*) FROM mistake_puzzles {} AND is_miss = 1",
-        base_where
-    );
-
-    let query = |sql: &str| -> Result<i64, Error> {
-        if source.is_empty() {
-            Ok(conn.query_row(sql, rusqlite::params![username], |r| r.get(0))?)
-        } else {
-            Ok(conn.query_row(sql, rusqlite::params![username, source], |r| r.get(0))?)
-        }
-    };
-
-    let total = query(&count_sql)?;
-    let solved_correct = query(&correct_sql)?;
-    let solved_wrong = query(&wrong_sql)?;
-    let unsolved = query(&unsolved_sql)?;
-    let blunders = query(&blunders_sql)?;
-    let mistakes = query(&mistakes_sql)?;
-    let inaccuracies = query(&inaccuracies_sql)?;
-    let misses = query(&misses_sql)?;
-
+    let total = filtered.len() as i64;
+    let solved_correct = filtered.iter().filter(|p| p.completed == 1).count() as i64;
+    let solved_wrong = filtered.iter().filter(|p| p.completed == 2).count() as i64;
+    let unsolved = filtered.iter().filter(|p| p.completed == 0).count() as i64;
+    let blunders = filtered.iter().filter(|p| p.annotation == "??").count() as i64;
+    let mistakes = filtered.iter().filter(|p| p.annotation == "?").count() as i64;
+    let inaccuracies = filtered.iter().filter(|p| p.annotation == "?!").count() as i64;
+    let misses = filtered.iter().filter(|p| p.is_miss == 1).count() as i64;
     let accuracy = if solved_correct + solved_wrong > 0 {
         (solved_correct as f64 / (solved_correct + solved_wrong) as f64) * 100.0
     } else {
         0.0
-    };
-
-    // Get game accuracy from analysis_metadata table
-    let game_accuracy = {
-        let ga_result: Result<f64, _> = if source.is_empty() {
-            conn.query_row(
-                "SELECT game_accuracy FROM analysis_metadata WHERE username = ?1 LIMIT 1",
-                rusqlite::params![username],
-                |r| r.get(0),
-            )
-        } else {
-            conn.query_row(
-                "SELECT game_accuracy FROM analysis_metadata WHERE username = ?1 AND source = ?2",
-                rusqlite::params![username, source],
-                |r| r.get(0),
-            )
-        };
-        ga_result.unwrap_or(0.0)
     };
 
     Ok(MistakeStats {
@@ -2662,7 +2841,7 @@ fn get_stats_from_db(
         inaccuracies,
         misses,
         accuracy,
-        game_accuracy,
+        game_accuracy: metadata.game_accuracy,
     })
 }
 
@@ -2670,20 +2849,12 @@ fn get_stats_from_db(
 #[specta::specta]
 pub fn delete_mistake_puzzles(
     db_path: String,
-    username: String,
-    source: Option<String>,
+    _username: String,
+    _source: Option<String>,
 ) -> Result<(), Error> {
-    let conn = open_db(&db_path)?;
-    if let Some(src) = source {
-        conn.execute(
-            "DELETE FROM mistake_puzzles WHERE username = ?1 AND source = ?2",
-            rusqlite::params![username, src],
-        )?;
-    } else {
-        conn.execute(
-            "DELETE FROM mistake_puzzles WHERE username = ?1",
-            rusqlite::params![username],
-        )?;
+    // Delete the PGN file entirely (each file is per-analysis run)
+    if std::path::Path::new(&db_path).exists() {
+        std::fs::remove_file(&db_path)?;
     }
     Ok(())
 }
@@ -2691,7 +2862,10 @@ pub fn delete_mistake_puzzles(
 #[tauri::command]
 #[specta::specta]
 pub fn init_mistake_db(db_path: String) -> Result<(), Error> {
-    open_db(&db_path)?;
+    // Ensure the parent directory exists; no DB initialization needed for PGN
+    if let Some(parent) = std::path::Path::new(&db_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     Ok(())
 }
 
@@ -2740,46 +2914,16 @@ pub fn export_mistakes_to_puzzle_db(
     username: String,
     source: String,
 ) -> Result<i32, Error> {
-    let mistake_conn = open_db(&mistake_db_path)?;
+    // Read mistakes from PGN file
+    let (puzzles, _metadata) = read_mistakes_from_pgn(&mistake_db_path)?;
 
-    // Read all mistakes with predecessor info + fen for fallback
-    let mut stmt = mistake_conn.prepare(
-        "SELECT predecessor_fen, predecessor_move, best_line, annotation, fen, opponent_punishment, opponent_line, is_miss
-         FROM mistake_puzzles
-         WHERE username = ?1 AND source = ?2
-         ORDER BY id ASC",
-    )?;
-
-    struct ExportRow {
-        predecessor_fen: String,
-        predecessor_move: String,
-        best_line: String,
-        annotation: String,
-        fen: String,
-        opponent_punishment: String,
-        opponent_line: String,
-        is_miss: bool,
-    }
-
-    let rows: Vec<ExportRow> = stmt
-        .query_map(rusqlite::params![&username, &source], |row| {
-            Ok(ExportRow {
-                predecessor_fen: row.get(0)?,
-                predecessor_move: row.get(1)?,
-                best_line: row.get(2)?,
-                annotation: row.get(3)?,
-                fen: row.get(4)?,
-                opponent_punishment: row.get(5)?,
-                opponent_line: row.get(6)?,
-                is_miss: row.get::<_, i32>(7)? != 0,
-            })
-        })?
-        .filter_map(|r| r.ok())
+    let filtered: Vec<&MistakePuzzle> = puzzles
+        .iter()
+        .filter(|p| p.username == username && p.source == source)
         .collect();
 
-    // Create/open the puzzle DB
-    let puzzle_conn = rusqlite::Connection::open(&puzzle_db_path)?;
-    puzzle_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    // Create/open the puzzle DB (standard Lichess puzzle format)
+    let puzzle_conn = open_puzzle_db(&puzzle_db_path)?;
     puzzle_conn.execute_batch(CREATE_PUZZLE_TABLES)?;
 
     // Insert themes
@@ -2813,41 +2957,50 @@ pub fn export_mistakes_to_puzzle_db(
     let mut skipped_no_moves = 0i32;
     let mut skipped_too_short = 0i32;
 
-    for row in &rows {
-        // Determine the puzzle FEN and moves
+    for row in &filtered {
+        // Determine the puzzle FEN and moves.
+        // Standard Lichess puzzle format: FEN has opponent-to-move, first move
+        // in `moves` is auto-played (opponent's move), then user must find the
+        // correct reply.
+        //
+        // Case 1: We have predecessor info → standard format:
+        //   FEN = position before opponent's last move
+        //   moves = [opponent_move, player_best_move, ...]
+        //
+        // Case 2: No predecessor (e.g. first move) but we have the mistake FEN
+        //   and best_line → construct from the mistake's played move:
+        //   Compute FEN after player's bad move (opponent to move).
+        //   moves = [opponent_punishment, player's best response...]
+        //   The puzzle becomes: "opponent punishes your mistake — find the defense"
         let (puzzle_fen, puzzle_moves) =
             if !row.predecessor_fen.is_empty() && !row.predecessor_move.is_empty() {
-                // Standard Lichess format: FEN before opponent's move,
-                // moves = [opponent_move, player_best_move, ...]
+                // Standard: predecessor FEN + opponent's move + best continuation
                 let moves = format!("{} {}", row.predecessor_move, row.best_line);
                 (row.predecessor_fen.clone(), moves)
-            } else if !row.best_line.is_empty() {
-                // No predecessor (first move of game for White, or edge case).
-                // Use the mistake FEN directly. The best_line starts with the player's
-                // best move. We need to prepend the opponent's punishment move so the
-                // puzzle format works: FEN (player's turn) → auto-play opponent_punishment
-                // → user finds the refutation from best_line.
-                // Actually, for the Lichess format, FEN must have opposite side to move.
-                // Since we have the player's FEN (player to move), the PuzzleBoard will
-                // flip the orientation wrong. Instead, use the fen directly with the
-                // opponent_punishment as setup move, and then best_line as the answer.
-                if !row.opponent_punishment.is_empty() && !row.opponent_line.is_empty() {
-                    // Use the fen (player's turn). PuzzleBoard will auto-play opponent_punishment
-                    // and player responds with best_line moves.
-                    // BUT the Lichess convention says: FEN has opponent-to-move, first move is auto-played.
-                    // Here, FEN has player-to-move. We can't use opponent_punishment as auto-play
-                    // because it would be an illegal move on the player's turn position.
-                    // Skip these — they don't map to the standard puzzle format cleanly.
-                    info!(
-                        "Skipping first-move mistake (no predecessor): fen={}",
-                        row.fen
-                    );
-                    skipped_no_moves += 1;
-                    continue;
-                } else {
-                    skipped_no_moves += 1;
-                    continue;
+            } else if !row.opponent_punishment.is_empty() && !row.best_line.is_empty() {
+                // Fallback: compute FEN after player's bad move, use opponent's
+                // punishment as the auto-played move, and best_line as the solution
+                match compute_fen_after(&row.fen, &row.played_move) {
+                    Ok(fen_after_mistake) => {
+                        // fen_after_mistake has opponent to move — correct for puzzle format
+                        // moves: opponent_punishment (auto-played), then best reply from best_line
+                        let moves = format!("{} {}", row.opponent_punishment, row.best_line);
+                        (fen_after_mistake, moves)
+                    }
+                    Err(e) => {
+                        info!("Skipping mistake (can't compute fen after): {} — {}", row.fen, e);
+                        skipped_no_moves += 1;
+                        continue;
+                    }
                 }
+            } else if !row.best_line.is_empty() {
+                // Last resort: use mistake FEN directly with best_line.
+                // This only works if the FEN has the right side-to-move for puzzles.
+                // The player made a mistake here → best_line starts with player's
+                // correct move. But Lichess format expects opponent-to-move FEN.
+                // Skip these as they don't fit the standard format.
+                skipped_no_moves += 1;
+                continue;
             } else {
                 skipped_no_moves += 1;
                 continue;
@@ -2856,8 +3009,6 @@ pub fn export_mistakes_to_puzzle_db(
         // Ensure moves has an even number of tokens (ends on user answer)
         let move_tokens: Vec<&str> = puzzle_moves.split_whitespace().collect();
         let trimmed = if move_tokens.len() % 2 == 1 {
-            // Odd total: the last move would be auto-played (opponent response, not a user answer)
-            // Trim it so the puzzle ends on the user's answer
             move_tokens[..move_tokens.len() - 1].join(" ")
         } else {
             puzzle_moves.clone()
@@ -2865,10 +3016,11 @@ pub fn export_mistakes_to_puzzle_db(
 
         if trimmed.split_whitespace().count() < 2 {
             skipped_too_short += 1;
-            continue; // Need at least setup + answer
+            continue;
         }
 
         let rating = rating_from_annotation(&row.annotation);
+        let is_miss = row.is_miss != 0;
 
         puzzle_conn.execute(
             "INSERT INTO puzzles (fen, moves, rating, rating_deviation, popularity, nb_plays)
@@ -2900,7 +3052,7 @@ pub fn export_mistakes_to_puzzle_db(
         }
 
         // Also link to miss theme if it's a miss (can be both mistake + miss)
-        if row.is_miss && row.annotation != "miss" {
+        if is_miss && row.annotation != "miss" {
             puzzle_conn.execute(
                 "INSERT OR IGNORE INTO puzzle_themes (puzzle_id, theme_id) VALUES (?1, ?2)",
                 rusqlite::params![puzzle_id, miss_theme_id],
@@ -2911,9 +3063,13 @@ pub fn export_mistakes_to_puzzle_db(
     }
 
     info!(
-        "Export complete: {} puzzles exported, {} skipped (no predecessor), {} skipped (too short), {} total mistakes",
-        exported, skipped_no_moves, skipped_too_short, rows.len()
+        "Export complete: {} puzzles exported, {} skipped (no moves/predecessor), {} skipped (too short), {} total mistakes",
+        exported, skipped_no_moves, skipped_too_short, filtered.len()
     );
+
+    // Explicitly close the connection to release file handles before the
+    // frontend tries to read the DB (especially important on Windows).
+    drop(puzzle_conn);
 
     Ok(exported)
 }

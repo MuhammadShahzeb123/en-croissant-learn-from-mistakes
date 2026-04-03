@@ -10,10 +10,10 @@ interface StatsPanelProps {
 export default function StatsPanel({ stats }: StatsPanelProps) {
   const { t } = useTranslation();
 
-  if (!stats || stats.total === 0) return null;
+  if (!stats || Number(stats.total) === 0) return null;
 
-  const solved = stats.solvedCorrect + stats.solvedWrong;
-  const solvedPct = stats.total > 0 ? (solved / stats.total) * 100 : 0;
+  const solved = Number(stats.solvedCorrect) + Number(stats.solvedWrong);
+  const solvedPct = Number(stats.total) > 0 ? (solved / Number(stats.total)) * 100 : 0;
 
   return (
     <Card withBorder shadow="sm" radius="md" p="md">
