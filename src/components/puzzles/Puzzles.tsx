@@ -177,7 +177,10 @@ function Puzzles({ id }: { id: string }) {
         setRatingRange([rating + 50, rating + 100]);
       }
     }
-    const res = await commands.getPuzzle(db, range[0], range[1], effectiveSelectedTheme);
+    const isMistakesDb = db.includes("my_mistakes");
+    const effRange = isMistakesDb ? [0, 5000] : range;
+
+    const res = await commands.getPuzzle(db, effRange[0], effRange[1], effectiveSelectedTheme);
     const puzzle = unwrap(res);
     const newPuzzle: Puzzle = {
       ...puzzle,
@@ -429,7 +432,7 @@ function Puzzles({ id }: { id: string }) {
                       max={2800}
                       value={ratingRange}
                       onChange={setRatingRange}
-                      disabled={progressive}
+                      disabled={progressive || (selectedDb?.includes("my_mistakes") ?? false)}
                       marks={[
                         { value: 600, label: "600" },
                         { value: 1700, label: "1700" },
@@ -548,7 +551,7 @@ function Puzzles({ id }: { id: string }) {
             )}
           </Group>
           <Divider my="sm" />
-          {!isPuzzleIncomplete && (puzzles[currentPuzzle]?.themes?.length ?? 0) > 0 && (
+          {(puzzles[currentPuzzle]?.themes?.length ?? 0) > 0 && (
             <Group gap="xs" mb="sm">
               {puzzles[currentPuzzle]?.themes?.map((theme) => (
                 <Badge key={theme} variant="light" size="sm">
@@ -558,13 +561,20 @@ function Puzzles({ id }: { id: string }) {
             </Group>
           )}
           <Group justify="space-between">
-            <Text fz="1.75rem" fw={500}>
-              {!turnToMove
-                ? ""
-                : turnToMove === "white"
-                  ? t("Fen.BlackToMove")
-                  : t("Fen.WhiteToMove")}
-            </Text>
+            <Group gap="md">
+              <Text fz="1.75rem" fw={500}>
+                {!turnToMove
+                  ? ""
+                  : turnToMove === "white"
+                    ? t("Fen.BlackToMove")
+                    : t("Fen.WhiteToMove")}
+              </Text>
+              {turnToMove && (
+                <Badge size="lg" color={turnToMove === "white" ? "dark" : "gray"} variant="filled">
+                  You play as {turnToMove === "white" ? "Black" : "White"}
+                </Badge>
+              )}
+            </Group>
             <Group gap="xs">
               <Tooltip label={t("Puzzle.NewPuzzle")}>
                 <ActionIcon

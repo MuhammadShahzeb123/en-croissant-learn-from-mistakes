@@ -10,7 +10,44 @@ interface StatsPanelProps {
 export default function StatsPanel({ stats }: StatsPanelProps) {
   const { t } = useTranslation();
 
-  if (!stats || Number(stats.total) === 0) return null;
+  if (!stats) return null;
+
+  if (Number(stats.total) === 0) {
+    return (
+      <Card withBorder shadow="sm" radius="md" p="md">
+        <Stack align="center" gap="xs">
+          <Text size="lg" fw={600}>No mistakes found!</Text>
+          <Text c="dimmed" size="sm">Your accuracy was impressive in these games.</Text>
+          {stats.gameAccuracy > 0 && (
+            <Group gap="md" mt="sm">
+              <RingProgress
+                size={80}
+                thickness={8}
+                roundCaps
+                sections={[
+                  { value: stats.gameAccuracy, color: "blue" },
+                  { value: 100 - stats.gameAccuracy, color: "gray.3" },
+                ]}
+                label={
+                  <Text ta="center" size="xs" fw={700}>
+                    {stats.gameAccuracy.toFixed(1)}%
+                  </Text>
+                }
+              />
+              <Stack gap={2}>
+                <Text size="sm" c="dimmed">
+                  {t("LearnFromMistakes.GameAccuracy", { defaultValue: "Game Accuracy" })}
+                </Text>
+                <Text size="xs" c="dimmed">
+                  Chess.com-style
+                </Text>
+              </Stack>
+            </Group>
+          )}
+        </Stack>
+      </Card>
+    );
+  }
 
   const solved = Number(stats.solvedCorrect) + Number(stats.solvedWrong);
   const solvedPct = Number(stats.total) > 0 ? (solved / Number(stats.total)) * 100 : 0;
